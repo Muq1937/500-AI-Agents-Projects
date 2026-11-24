@@ -33,6 +33,12 @@ back to the per-requirement assessments:
 
 `score = 100 × earned / maximum`. The code also guarantees that every JD requirement
 is assessed exactly once, and that a missing must-have is always ranked **blocking**.
+The gap list is reconciled with the assessments: every unmet requirement appears once,
+and gaps the LLM invents are dropped.
+
+Eligibility criteria (enrollment, graduation date, availability, location) are checked
+separately as met / not-met / unclear and are not part of the score. A criterion the resume
+contradicts is always a **blocking** gap; one the resume doesn't mention is only marked unclear.
 
 ## Architecture
 
@@ -104,18 +110,26 @@ Without `--jobs`, it searches a built-in catalog of 14 fictional internships in 
 
 **How it works.** Running the Matching Agent on every posting would take one LLM call per job,
 so search uses a deterministic matcher on the same met / partial / missing scale and weights as
-the main score. It knows three kinds of relationship between skills:
+the main score. It knows these relationships between skills:
 
 | | Example | Result |
 |---|---|---|
 | Aliases | `Postgres` for *PostgreSQL*, `ReactJS` for *React* | met |
 | Implications | `PostgreSQL` for *SQL*, `Next.js` for *JavaScript*, `scikit-learn` for *Machine Learning* | met |
 | Families | `MySQL` for *PostgreSQL*, `Flask` for *FastAPI or Django* | partial |
+| Compounds | `HTML` alone for *HTML/CSS* | partial |
+| Umbrella terms | `Azure` or general cloud for *Cloud (AWS/GCP)* | partial |
 
-Requirements with alternatives (`FastAPI or Django`, `Cloud (AWS/GCP)`) are met by any one of them.
+Requirements with alternatives (`FastAPI or Django`, `Cloud (AWS/GCP)`) are met by any one of them,
+and the same skill listed twice under different names (`Postgres`, `PostgreSQL`) counts once.
 Ties are broken by the number of missing must-haves. A skill that isn't in the matcher's tables
 (for example `Spring Boot`) only matches its exact name. That is what `--rerank` is for: the
 LLM judges the top results from your full resume, including how deep each skill goes.
+
+**LLM call budget.** A search is refused before it starts if it would make more than
+`--max-llm-calls` calls (default 10), counting the resume, each description-only posting and
+each re-check. This keeps a large or untrusted catalog from draining your Gemini quota. If the
+quota still runs out during `--rerank`, you get the quick ranking instead of an error.
 
 ```
  1. Software Engineer Intern (Backend) — FinTech startup · Bangkok
@@ -130,7 +144,7 @@ None of these call the LLM, so they run without an API key.
 ```bash
 python agent.py --eval        # accuracy against hand-labeled cases
 python agent.py --bench       # search speed on synthetic catalogs of 1k / 10k / 50k jobs
-python agent.py --self-test   # unit, accuracy and performance tests (also: python -m unittest agent)
+python agent.py --self-test   # 17 unit, accuracy and performance tests (also: python -m unittest agent)
 ```
 
 **Accuracy** (`--eval`) is measured at two levels and compared with an exact-name baseline
@@ -138,7 +152,7 @@ that uses the same weights but no aliases, implications or families:
 
 | Level | Metric | Matcher | Exact-name baseline |
 |---|---|---|---|
-| Requirement (39 cases) | status accuracy (met/partial/missing) | 92.3% | 15.4% |
+| Requirement (43 cases) | status accuracy (met/partial/missing) | 93.0% | 16.3% |
 | Ranking (9 candidates × 14 jobs) | Top-1 (best result is a strong fit) | 0.89 | 0.78 |
 | | MRR (first strong fit) | 0.91 | 0.87 |
 | | NDCG@5 | 0.95 | 0.91 |
@@ -158,9 +172,9 @@ in `agent.py`.
 
 | Jobs | Index build | Search p50 | Search p95 |
 |---|---|---|---|
-| 1,000 | 26 ms | 3.2 ms | 3.5 ms |
-| 10,000 | 267 ms | 22.8 ms | 30.0 ms |
-| 50,000 | 1.2 s | 98 ms | 109 ms |
+| 1,000 | 11 ms | 3.4 ms | 5.2 ms |
+| 10,000 | 118 ms | 24.3 ms | 31.8 ms |
+| 50,000 | 404 ms | 95 ms | 110 ms |
 
 Search time grows linearly with the catalog, at about 400k jobs/second. Requirements are
 parsed once when the index is built, each skill verdict is cached per search, and the detailed

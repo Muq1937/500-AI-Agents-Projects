@@ -61,8 +61,22 @@ def get_llm() -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", DEFAULT_MODEL))
 
 
+# Far above any resume or job posting, and well within Gemini's input limit.
+MAX_INPUT_CHARS = 100_000
+
+
+class InputTooLongError(ValueError):
+    pass
+
+
 def ask(schema: type[BaseModel], system: str, user: str) -> BaseModel:
-    """Call Gemini and parse the reply straight into a Pydantic model."""
+    """Call Gemini and parse the reply straight into a Pydantic model.
+
+    The client already retries transient errors (max_retries defaults to 6).
+    """
+    if len(user) > MAX_INPUT_CHARS:
+        raise InputTooLongError(f"Input is {len(user):,} characters; the limit is {MAX_INPUT_CHARS:,}. "
+                                "Pass the resume or job description alone, not a whole document.")
     llm = get_llm().with_structured_output(schema)
     return llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
 
@@ -112,18 +126,26 @@ class RequirementAssessment(BaseModel):
     evidence: str = Field(description="Quote or paraphrase from the resume, or what is absent")
 
 
+class EligibilityCheck(BaseModel):
+    criterion: str = Field(description="Exactly as given in the eligibility list")
+    status: Literal["met", "not-met", "unclear"]
+    evidence: str = Field(description="What the resume says, or that it does not say")
+
+
 class MatchAssessment(BaseModel):
     """What the Matching Agent asks the LLM for."""
 
     assessments: list[RequirementAssessment]
+    eligibility: list[EligibilityCheck] = Field(default_factory=list)
     summary: str = Field(description="2-3 sentences on overall fit, without a numeric score")
 
 
 class MatchResult(BaseModel):
-    """Output of the Matching Agent (score computed in code)."""
+    """Output of the Matching Agent (score computed in code, from skills only)."""
 
     score: int
     assessments: list[RequirementAssessment]
+    eligibility: list[EligibilityCheck] = Field(default_factory=list)
     summary: str
 
 
@@ -203,7 +225,10 @@ Assess EVERY requirement in the list, keeping its skill name and importance exac
 - met: clear evidence in the profile (skills, projects, experience).
 - partial: related or shallow evidence (coursework only, an adjacent tool, a basic level).
 - missing: no evidence.
-Be strict: do not assume skills without evidence. Do not output a numeric score."""
+Be strict: do not assume skills without evidence. Do not output a numeric score.
+Also check EVERY eligibility criterion (enrollment, graduation date, availability, location), keeping its
+text exactly as given: met (the resume confirms it), not-met (the resume contradicts it), or unclear
+(the resume does not say). Never mark a criterion not-met just because the resume is silent."""
 
 GAP_PROMPT = """You are a career coach. Given the requirements a candidate has not fully met, classify each gap:
 - blocking: a must-have that is missing; likely to fail screening.
@@ -251,8 +276,9 @@ def dedupe_requirements(must_have: list[str], nice_to_have: list[str]) -> list[t
     """One (skill, importance) per requirement, so no skill is scored twice; must-have wins."""
     requirements, seen = [], set()
     for skill, importance in [(s, "must-have") for s in must_have] + [(s, "nice-to-have") for s in nice_to_have]:
-        if norm(skill) and norm(skill) not in seen:
-            seen.add(norm(skill))
+        key = canon(skill)  # so "Postgres" and "PostgreSQL" count once
+        if key and key not in seen:
+            seen.add(key)
             requirements.append((skill, importance))
     return requirements
 
@@ -263,19 +289,20 @@ def match_skills(state: CareerState) -> CareerState:
     requirements = dedupe_requirements(jd.must_have_skills, jd.nice_to_have_skills)
     requirement_list = "\n".join(f"- {skill} ({importance})" for skill, importance in requirements)
 
+    eligibility_list = "\n".join(f"- {c}" for c in jd.eligibility) or "(none)"
     result = ask(
         MatchAssessment,
         MATCH_PROMPT,
         f"Candidate profile:\n{state['resume_profile'].model_dump_json(indent=2)}\n\n"
-        f"Requirements:\n{requirement_list}",
+        f"Requirements:\n{requirement_list}\n\nEligibility criteria:\n{eligibility_list}",
     )
 
     # Keep exactly one assessment per JD requirement: drop extras the LLM invented,
     # and count any requirement it skipped as missing.
-    by_skill = {norm(a.skill): a for a in result.assessments}
+    by_skill = {canon(a.skill): a for a in result.assessments}
     assessments = []
     for skill, importance in requirements:
-        found = by_skill.get(norm(skill))
+        found = by_skill.get(canon(skill))
         if found:
             assessments.append(found.model_copy(update={"skill": skill, "importance": importance}))
         else:
@@ -283,15 +310,62 @@ def match_skills(state: CareerState) -> CareerState:
                 skill=skill, importance=importance, status="missing", evidence="Not assessed; treated as missing."
             ))
 
-    match = MatchResult(score=score_assessments(assessments), assessments=assessments, summary=result.summary)
+    # Same for eligibility; a criterion the LLM skipped is unclear, not failed.
+    by_criterion = {norm(c.criterion): c for c in result.eligibility}
+    eligibility = [
+        by_criterion[norm(c)].model_copy(update={"criterion": c}) if norm(c) in by_criterion
+        else EligibilityCheck(criterion=c, status="unclear", evidence="Not assessed.")
+        for c in jd.eligibility
+    ]
+
+    match = MatchResult(score=score_assessments(assessments), assessments=assessments,
+                        eligibility=eligibility, summary=result.summary)
     return {"match": match}
+
+
+def default_severity(item: RequirementAssessment) -> str:
+    if item.importance == "must-have":
+        return "blocking" if item.status == "missing" else "important"
+    return "nice-to-have"
+
+
+def reconcile_gaps(open_items: list[RequirementAssessment], returned: list[SkillGap],
+                   eligibility: list[EligibilityCheck]) -> list[SkillGap]:
+    """Exactly one gap per unmet requirement, ordered by severity.
+
+    Gaps the LLM invented or repeated are dropped, requirements it skipped are added back,
+    a missing must-have is always blocking, and so is an eligibility criterion that is not met.
+    """
+    open_by_key = {canon(item.skill): item for item in open_items}
+    gaps: dict[str, SkillGap] = {}
+    for gap in returned:
+        key = canon(gap.skill)
+        item = open_by_key.get(key)
+        if item is None or key in gaps:
+            continue
+        severity = "blocking" if default_severity(item) == "blocking" else gap.severity
+        gaps[key] = gap.model_copy(update={"skill": item.skill, "severity": severity})
+    for key, item in open_by_key.items():
+        if key not in gaps:
+            gaps[key] = SkillGap(skill=item.skill, severity=default_severity(item),
+                                 evidence=f"Listed as {item.importance} in the job description",
+                                 why_it_matters=f"The candidate's evidence for it is {item.status}.")
+    for check in eligibility:
+        if check.status == "not-met":
+            gaps[f"eligibility:{norm(check.criterion)}"] = SkillGap(
+                skill=check.criterion, severity="blocking", evidence="Eligibility criterion in the job description",
+                why_it_matters=f"Applications that miss eligibility are usually screened out. {check.evidence}")
+    order = {"blocking": 0, "important": 1, "nice-to-have": 2}
+    return sorted(gaps.values(), key=lambda g: order[g.severity])
 
 
 def analyze_gaps(state: CareerState) -> CareerState:
     """Gap Analysis Agent: rank missing/partial skills by severity with JD evidence."""
-    open_items = [a for a in state["match"].assessments if a.status != "met"]
+    match = state["match"]
+    open_items = [a for a in match.assessments if a.status != "met"]
     if not open_items:
-        return {"gap_analysis": GapAnalysis(strengths=["Meets every listed requirement."])}
+        gaps = reconcile_gaps([], [], match.eligibility)
+        return {"gap_analysis": GapAnalysis(gaps=gaps, strengths=["Meets every listed skill requirement."])}
 
     jd = state["job_requirements"]
     analysis = ask(
@@ -302,19 +376,17 @@ def analyze_gaps(state: CareerState) -> CareerState:
         + json.dumps([a.model_dump() for a in open_items], indent=2, ensure_ascii=False)
         + f"\n\nCandidate profile:\n{state['resume_profile'].model_dump_json(indent=2)}",
     )
-
-    # Enforce the one rule that should never depend on the model's judgment.
-    status = {norm(a.skill): a for a in open_items}
-    gaps = []
-    for gap in analysis.gaps:
-        item = status.get(norm(gap.skill))
-        if item and item.importance == "must-have" and item.status == "missing":
-            gap = gap.model_copy(update={"severity": "blocking"})
-        gaps.append(gap)
-    order = {"blocking": 0, "important": 1, "nice-to-have": 2}
-    gaps.sort(key=lambda g: order[g.severity])
-
+    gaps = reconcile_gaps(open_items, analysis.gaps, match.eligibility)
     return {"gap_analysis": analysis.model_copy(update={"gaps": gaps})}
+
+
+def fit_plan(plan: list[WeekPlan], weeks: int) -> list[WeekPlan]:
+    """Hold the learning plan to the requested length, numbered 1..weeks."""
+    plan = sorted(plan, key=lambda w: w.week)
+    if len(plan) != weeks:
+        print(f"⚠️  The model returned a {len(plan)}-week plan for a {weeks}-week request; "
+              + ("keeping the first weeks." if len(plan) > weeks else "showing what it returned."), file=sys.stderr)
+    return [w.model_copy(update={"week": i}) for i, w in enumerate(plan[:weeks], 1)]
 
 
 def recommend(state: CareerState) -> CareerState:
@@ -329,7 +401,8 @@ def recommend(state: CareerState) -> CareerState:
         f"Match score: {state['match'].score}/100\n{state['match'].summary}\n\n"
         f"Gap analysis:\n{state['gap_analysis'].model_dump_json(indent=2)}",
     )
-    return {"recommendation": recommendation}
+    plan = fit_plan(recommendation.learning_plan, weeks)
+    return {"recommendation": recommendation.model_copy(update={"learning_plan": plan})}
 
 
 def build_graph():
@@ -366,10 +439,9 @@ def build_graph():
 ALIASES = {
     "postgres": "postgresql", "psql": "postgresql", "mssql": "sqlserver", "mongo": "mongodb",
     "js": "javascript", "es6": "javascript", "ts": "typescript", "reactjs": "react", "vuejs": "vue",
-    "angularjs": "angular", "node": "nodejs", "expressjs": "express", "html": "htmlcss", "css": "htmlcss",
-    "html5": "htmlcss", "css3": "htmlcss", "golang": "go", "csharp": "c#", "cpp": "c++",
+    "angularjs": "angular", "node": "nodejs", "expressjs": "express", "html5": "html", "css3": "css",
+    "golang": "go", "csharp": "c#", "cpp": "c++", "cloudcomputing": "cloud",
     "sklearn": "scikitlearn", "ml": "machinelearning", "dl": "deeplearning", "naturallanguageprocessing": "nlp",
-    "github": "git", "gitlab": "git", "bitbucket": "git",
     "rest": "restapi", "restapis": "restapi", "restapidesign": "restapi", "restful": "restapi",
     "restfulapi": "restapi", "restfulapis": "restapi",
     "amazonwebservices": "aws", "googlecloud": "gcp", "googlecloudplatform": "gcp", "microsoftazure": "azure",
@@ -400,7 +472,16 @@ IMPLIES = {
     "junit": ["softwaretesting", "java"], "cypress": ["softwaretesting", "javascript"],
     "githubactions": ["cicd"], "jenkins": ["cicd"], "gitlabci": ["cicd"],
     "airflow": ["etl"], "spark": ["etl"], "dbt": ["etl", "sql"], "rtos": ["microcontrollers"],
+    "github": ["git"], "gitlab": ["git"], "bitbucket": ["git"],
+    "htmlcss": ["html", "css"],
 }
+
+# Requirements that need every part: HTML alone is only partial for "HTML/CSS".
+COMPOUNDS = {"htmlcss": ("html", "css")}
+
+# Marks an umbrella term from "Cloud (AWS/GCP)": general cloud experience is only partial
+# credit when the posting names specific providers.
+UMBRELLA = "~"
 
 FAMILIES = [
     {"postgresql", "mysql", "sqlite", "sqlserver", "oracle", "mariadb"},
@@ -444,22 +525,22 @@ def canon(skill: str) -> str:
 def alternatives(requirement: str) -> tuple[str, ...]:
     """Canonical skills that each satisfy a requirement.
 
-    'FastAPI or Django' -> (fastapi, django); 'Cloud (AWS/GCP)' -> (cloud, aws, gcp);
-    'CI/CD' and 'HTML/CSS' stay one skill because they are known names.
+    'FastAPI or Django' -> (fastapi, django); 'Cloud (AWS/GCP)' -> (aws, gcp, ~cloud), where
+    ~cloud gives partial credit only; 'CI/CD' and 'HTML/CSS' stay one skill because they are known names.
     """
     whole = canon(requirement)
     if whole in KNOWN_SKILLS:
         return (whole,)
-    parts = []
+    umbrella = []
     m = re.fullmatch(r"(.*?)\((.+)\)\s*", requirement)
     if m:
         outer = canon(m.group(1))
         if outer in KNOWN_SKILLS:
-            parts.append(outer)
+            umbrella.append(UMBRELLA + outer)
         body = m.group(2)
     else:
         body = requirement
-    parts += [canon(p) for p in re.split(r"\s+or\s+|/|,|\|", body, flags=re.IGNORECASE)]
+    parts = [canon(p) for p in re.split(r"\s+or\s+|/|,|\|", body, flags=re.IGNORECASE)] + umbrella
     return tuple(dict.fromkeys(p for p in parts if p)) or (whole,)
 
 
@@ -481,9 +562,21 @@ class SkillMatcher:
                 if implied not in self.has:
                     self.has[implied] = source
                     stack.append((implied, source))
+        for compound, parts in COMPOUNDS.items():
+            if compound not in self.has and all(p in self.has for p in parts):
+                self.has[compound] = " + ".join(dict.fromkeys(self.has[p] for p in parts))
         self._cache: dict[tuple[str, ...], tuple[str, str]] = {}
 
     def _judge_one(self, skill: str) -> tuple[str, str]:
+        if skill.startswith(UMBRELLA):
+            general = skill[len(UMBRELLA):]
+            if general in self.has:
+                return "partial", f"Lists {self.has[general]}, but not one of the named options"
+            return "missing", "No matching or related skill listed"
+        if skill in COMPOUNDS and skill not in self.has:
+            have = [self.has[p] for p in COMPOUNDS[skill] if p in self.has]
+            if have:
+                return "partial", f"Lists only {', '.join(have)}"
         if skill in self.has:
             implied = "" if skill in self.listed else ", which implies it"
             return "met", f"Lists {self.has[skill]}{implied}"
@@ -587,6 +680,8 @@ def find_jobs(skills: list[str], jobs: list[JobPosting], top: int = 5, rerank: i
 
     Pass a dict as `timings` to get the time spent in each stage (ms).
     """
+    if top < 1 or rerank < 0:
+        raise ValueError(f"top must be at least 1 and rerank at least 0 (got top={top}, rerank={rerank})")
     timings = {} if timings is None else timings
     start = time.perf_counter()
     matches = JobIndex(jobs).rank(skills, top=max(top, rerank))
@@ -594,9 +689,13 @@ def find_jobs(skills: list[str], jobs: list[JobPosting], top: int = 5, rerank: i
     if rerank and matches:
         start = time.perf_counter()
         profile = profile or ResumeProfile(name="Candidate", skills=skills)
-        matches = rerank_with_llm(matches[:rerank], profile) + matches[rerank:]
+        try:
+            matches = rerank_with_llm(matches[:rerank], profile) + matches[rerank:]
+            timings["reranked"] = min(rerank, len(matches))
+        except ModelRateLimitError:
+            # The quick ranking is still valid; return it rather than nothing.
+            print("⚠️  Gemini quota ran out during the LLM re-check; showing the quick ranking.", file=sys.stderr)
         timings["rerank_ms"] = (time.perf_counter() - start) * 1000
-        timings["reranked"] = min(rerank, len(matches))
     return matches[:top]
 
 
@@ -686,12 +785,17 @@ SAMPLE_JOBS = [
 
 STATUS_ICON = {"met": "✅", "partial": "🟡", "missing": "❌"}
 SEVERITY_ICON = {"blocking": "🔴", "important": "🟠", "nice-to-have": "🟢"}
+ELIGIBILITY_ICON = {"met": "✅", "not-met": "❌", "unclear": "❔"}
 
 
 def read_text(source: str) -> str:
     """Read a .pdf or text file, or treat the argument itself as raw text."""
     path = Path(source)
-    if not path.is_file():
+    try:
+        is_file = path.is_file()
+    except OSError:  # e.g. ENAMETOOLONG: raw text longer than a file name can be
+        is_file = False
+    if not is_file:
         return source
     if path.suffix.lower() == ".pdf":
         from pypdf import PdfReader
@@ -709,6 +813,10 @@ def print_report(result: CareerState) -> None:
     print(f"{line}\n\n📊 MATCH SCORE: {match.score}/100\n{match.summary}\n")
     for a in match.assessments:
         print(f"  {STATUS_ICON[a.status]} {a.skill} ({a.importance}): {a.evidence}")
+    if match.eligibility:
+        print("\n  🎓 Eligibility (not part of the score):")
+        for c in match.eligibility:
+            print(f"  {ELIGIBILITY_ICON[c.status]} {c.criterion}: {c.evidence}")
 
     print(f"\n{line}\n🔍 GAP ANALYSIS\n{line}")
     for g in gaps.gaps:
@@ -740,13 +848,25 @@ def print_report(result: CareerState) -> None:
     print()
 
 
-def load_jobs(path: str) -> list[JobPosting]:
-    """Read postings from a JSON list. Each one needs a title and skill lists, or a raw
+def read_job_file(path: str) -> list[dict]:
+    items = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ValueError(f"{path} must contain a JSON list of job objects")
+    return items
+
+
+def needs_parsing(item: dict) -> bool:
+    """True for a description-only posting, which costs one LLM call to turn into skills."""
+    return not (item.get("must_have_skills") or item.get("nice_to_have_skills")) and bool(item.get("description"))
+
+
+def load_jobs(items: list[dict]) -> list[JobPosting]:
+    """Turn posting dicts into JobPostings. Each one needs a title and skill lists, or a raw
     "description" that the JD Analyzer turns into skills (one LLM call per such posting)."""
     jobs = []
-    for i, item in enumerate(json.loads(Path(path).read_text(encoding="utf-8")), 1):
+    for i, item in enumerate(items, 1):
         item = {**item, "id": str(item.get("id", f"job-{i}"))}
-        if not (item.get("must_have_skills") or item.get("nice_to_have_skills")) and item.get("description"):
+        if needs_parsing(item):
             jd = analyze_job({"job_description": item["description"]})["job_requirements"]
             item.update(title=item.get("title") or jd.title, company=item.get("company") or jd.company,
                         must_have_skills=jd.must_have_skills, nice_to_have_skills=jd.nice_to_have_skills)
@@ -767,7 +887,7 @@ def print_job_matches(matches: list[JobMatch], n_jobs: int, skills: list[str], t
         if m.llm_summary:
             print(f"    💬 {m.llm_summary}")
     timing = f"Ranked {n_jobs} jobs in {timings['rank_ms']:.1f} ms"
-    if "rerank_ms" in timings:
+    if "reranked" in timings:
         timing += f"; LLM re-check of the top {timings['reranked']} took {timings['rerank_ms'] / 1000:.1f} s"
     print(f"\n⏱️  {timing}.\n")
 
@@ -788,7 +908,8 @@ REQUIREMENT_CASES = [
     (["Django"], "FastAPI or Django", "met"),
     (["Flask"], "FastAPI or Django", "partial"),
     (["AWS"], "Cloud (AWS/GCP)", "met"),
-    (["Azure"], "Cloud (AWS/GCP)", "met"),
+    (["Azure"], "Cloud (AWS/GCP)", "partial"),
+    (["Cloud computing"], "Cloud (AWS/GCP)", "partial"),
     (["Azure"], "AWS or GCP", "partial"),
     (["ReactJS"], "React", "met"),
     (["Next.js"], "JavaScript", "met"),
@@ -810,6 +931,9 @@ REQUIREMENT_CASES = [
     (["Excel"], "Power BI", "missing"),
     (["Tableau"], "Tableau or Power BI", "met"),
     (["HTML", "CSS"], "HTML/CSS", "met"),
+    (["HTML/CSS"], "CSS", "met"),
+    (["HTML"], "HTML/CSS", "partial"),
+    (["CSS"], "HTML", "missing"),
     (["Node"], "Node.js", "met"),
     (["REST APIs"], "REST API design", "met"),
     (["Jetpack Compose"], "Android SDK", "met"),
@@ -977,7 +1101,7 @@ def print_benchmark(results: list[dict]) -> None:
 
 class TestSkillMatcher(unittest.TestCase):
     def test_alternatives(self):
-        self.assertEqual(alternatives("Cloud (AWS/GCP)"), ("cloud", "aws", "gcp"))
+        self.assertEqual(alternatives("Cloud (AWS/GCP)"), ("aws", "gcp", "~cloud"))
         self.assertEqual(alternatives("Tableau or Power BI"), ("tableau", "powerbi"))
         self.assertEqual(alternatives("C/C++"), ("c", "c++"))
         self.assertEqual(alternatives("CI/CD"), ("cicd",))
@@ -1035,6 +1159,79 @@ class TestJobSearch(unittest.TestCase):
         self.assertTrue(all(m.llm_score is None for m in reranked[3:]))
 
 
+class TestPipelineGuards(unittest.TestCase):
+    """Rules the code enforces on LLM output, and input checks at the CLI boundary."""
+
+    def test_aliases_are_one_requirement(self):
+        self.assertEqual(dedupe_requirements(["Postgres"], ["PostgreSQL", "Docker"]),
+                         [("Postgres", "must-have"), ("Docker", "nice-to-have")])
+
+    def test_gaps_are_reconciled_with_unmet_requirements(self):
+        open_items = [
+            RequirementAssessment(skill="PostgreSQL", importance="must-have", status="missing", evidence=""),
+            RequirementAssessment(skill="Docker", importance="nice-to-have", status="partial", evidence=""),
+        ]
+        returned = [
+            SkillGap(skill="Postgres", severity="important", evidence="", why_it_matters=""),  # alias, too mild
+            SkillGap(skill="postgresql", severity="important", evidence="", why_it_matters=""),  # duplicate
+            SkillGap(skill="Rust", severity="blocking", evidence="", why_it_matters=""),  # invented
+        ]
+        eligibility = [EligibilityCheck(criterion="Graduating in 2027", status="not-met", evidence="Graduates 2029."),
+                       EligibilityCheck(criterion="Based in Bangkok", status="unclear", evidence="")]
+        gaps = reconcile_gaps(open_items, returned, eligibility)
+        self.assertEqual([(g.skill, g.severity) for g in gaps], [
+            ("PostgreSQL", "blocking"), ("Graduating in 2027", "blocking"), ("Docker", "nice-to-have")])
+
+    def test_eligibility_is_checked_once_per_criterion_and_kept_out_of_the_score(self):
+        reply = MatchAssessment(
+            assessments=[RequirementAssessment(skill="Python", importance="must-have", status="met", evidence="")],
+            eligibility=[EligibilityCheck(criterion="enrolled in a CS degree", status="met", evidence="Year 3"),
+                         EligibilityCheck(criterion="Invented criterion", status="not-met", evidence="")],
+            summary="")
+        jd = JobRequirements(title="Intern", must_have_skills=["Python"],
+                             eligibility=["Enrolled in a CS degree", "Available summer 2027"])
+        with mock.patch.object(sys.modules[__name__], "ask", return_value=reply):
+            match = match_skills({"resume_profile": ResumeProfile(name="A"), "job_requirements": jd})["match"]
+        self.assertEqual(match.score, 100)
+        self.assertEqual([(c.criterion, c.status) for c in match.eligibility],
+                         [("Enrolled in a CS degree", "met"), ("Available summer 2027", "unclear")])
+
+    def test_learning_plan_is_held_to_the_requested_weeks(self):
+        plan = [WeekPlan(week=w, focus=str(w), tasks=[]) for w in (3, 1, 2, 4)]
+        with mock.patch("sys.stderr"):
+            fitted = fit_plan(plan, 3)
+        self.assertEqual([(w.week, w.focus) for w in fitted], [(1, "1"), (2, "2"), (3, "3")])
+
+    def test_invalid_counts_are_rejected(self):
+        with self.assertRaises(ValueError):
+            find_jobs(SAMPLE_SKILLS, SAMPLE_JOBS, rerank=-1)
+        with self.assertRaises(ValueError):
+            find_jobs(SAMPLE_SKILLS, SAMPLE_JOBS, top=0)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            int_at_least(1)("0")
+
+    def test_quota_during_rerank_keeps_the_quick_ranking(self):
+        quick = find_jobs(SAMPLE_SKILLS, SAMPLE_JOBS, top=5)
+        with mock.patch.object(sys.modules[__name__], "match_skills", side_effect=ModelRateLimitError("quota")), \
+                mock.patch("sys.stderr"):
+            reranked = find_jobs(SAMPLE_SKILLS, SAMPLE_JOBS, top=5, rerank=3)
+        self.assertEqual([m.job.id for m in reranked], [m.job.id for m in quick])
+
+    def test_llm_call_budget_is_counted_before_any_call(self):
+        items = [{"title": "A", "description": "..."}, {"title": "B", "must_have_skills": ["Go"]},
+                 {"description": "..."}]
+        args = argparse.Namespace(resume="cv.pdf", skills=None, rerank=3)
+        self.assertEqual(planned_llm_calls(args, items), 1 + 2 + 3)
+        args.skills = "Python"  # typed skills: the resume is not sent to the LLM
+        self.assertEqual(planned_llm_calls(args, items), 5)
+
+    def test_long_raw_text_is_not_treated_as_a_path(self):
+        text = "Python developer. " * 1000
+        self.assertEqual(read_text(text), text)
+        with self.assertRaises(InputTooLongError):
+            ask(ResumeProfile, "", "x" * (MAX_INPUT_CHARS + 1))
+
+
 class TestAccuracy(unittest.TestCase):
     def test_ranking_quality_and_beats_exact_name_baseline(self):
         ranking = evaluate()["ranking"]
@@ -1072,10 +1269,24 @@ def run_with_llm_errors(model: str, fn, *args):
         sys.exit("❌ Gemini rejected the API key. Check GOOGLE_API_KEY in .env.")
     except ModelNotFoundError:
         sys.exit(f"❌ Model '{model}' not found. Set GEMINI_MODEL in .env to a current Gemini model.")
+    except InputTooLongError as e:
+        sys.exit(f"❌ {e}")
+
+
+def planned_llm_calls(args, items: Optional[list[dict]]) -> int:
+    """LLM calls a search will make: resume extraction, description-only postings, re-checks."""
+    return (int(bool(args.resume) and not args.skills) + sum(map(needs_parsing, items or []))
+            + args.rerank)
 
 
 def run_find_jobs(args) -> None:
-    jobs = load_jobs(args.jobs) if args.jobs else SAMPLE_JOBS
+    items = read_job_file(args.jobs) if args.jobs else None
+    # Check the budget before any call, so a big catalog can't drain the quota half-way through.
+    calls = planned_llm_calls(args, items)
+    if calls > args.max_llm_calls:
+        sys.exit(f"❌ This search needs {calls} LLM calls, over --max-llm-calls {args.max_llm_calls}. "
+                 "Add skill lists to description-only postings, lower --rerank, or raise the limit.")
+    jobs = load_jobs(items) if items is not None else SAMPLE_JOBS
     profile = None
     if args.skills:
         skills = [s.strip() for s in args.skills.split(",") if s.strip()]
@@ -1095,11 +1306,26 @@ def run_find_jobs(args) -> None:
         print_job_matches(matches, len(jobs), skills, timings)
 
 
+def int_at_least(minimum: int):
+    """argparse type: an integer no smaller than `minimum`."""
+
+    def parse(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"'{value}' is not a whole number")
+        if number < minimum:
+            raise argparse.ArgumentTypeError(f"must be at least {minimum} (got {number})")
+        return number
+
+    return parse
+
+
 def main():
     parser = argparse.ArgumentParser(description="AI Career & Internship Agent")
     parser.add_argument("--resume", help="Path to resume (.pdf/.txt) or raw text")
     parser.add_argument("--job-desc", help="Path to job description file or raw text")
-    parser.add_argument("--weeks", type=int, default=3, help="Length of the learning plan (default: 3)")
+    parser.add_argument("--weeks", type=int_at_least(1), default=3, help="Length of the learning plan (default: 3)")
     parser.add_argument("--json", action="store_true", help="Print raw JSON instead of the report")
 
     mode = parser.add_mutually_exclusive_group()
@@ -1111,9 +1337,11 @@ def main():
     search = parser.add_argument_group("job search (--find-jobs)")
     search.add_argument("--skills", help='Comma-separated skills, e.g. "Python, SQL, React" (no LLM call needed)')
     search.add_argument("--jobs", help="JSON file of job postings (default: built-in internship catalog)")
-    search.add_argument("--top", type=int, default=5, help="Number of jobs to show (default: 5)")
-    search.add_argument("--rerank", type=int, default=0, metavar="N",
+    search.add_argument("--top", type=int_at_least(1), default=5, help="Number of jobs to show (default: 5)")
+    search.add_argument("--rerank", type=int_at_least(0), default=0, metavar="N",
                         help="Re-check the top N jobs with the LLM Matching Agent (N LLM calls)")
+    search.add_argument("--max-llm-calls", type=int_at_least(0), default=10, metavar="N",
+                        help="Refuse a search that would make more than N LLM calls (default: 10)")
     args = parser.parse_args()
 
     # Emoji and Thai text in the report crash non-UTF-8 consoles (e.g. default Windows code pages).
@@ -1140,7 +1368,7 @@ def main():
         "job_description": read_text(args.job_desc) if args.job_desc else SAMPLE_JOB_DESCRIPTION,
         "weeks": args.weeks,
     }
-    print(f"🚀 Analyzing with {model}...")
+    print(f"🚀 Analyzing with {model}...", file=sys.stderr)  # stderr keeps --json output parseable
     result = run_with_llm_errors(model, build_graph().invoke, state)
 
     if args.json:
