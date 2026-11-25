@@ -437,7 +437,8 @@ def build_graph():
 
 # Keys and values are norm()-ed names.
 ALIASES = {
-    "postgres": "postgresql", "psql": "postgresql", "mssql": "sqlserver", "mongo": "mongodb",
+    "python 3.11": "python", "java 17": "java", "bash scripting": "bash",
+    "spring boot": "spring","postgres": "postgresql", "psql": "postgresql", "mssql": "sqlserver", "mongo": "mongodb",
     "js": "javascript", "es6": "javascript", "ts": "typescript", "reactjs": "react", "vuejs": "vue",
     "angularjs": "angular", "node": "nodejs", "expressjs": "express", "html5": "html", "css3": "css",
     "golang": "go", "csharp": "c#", "cpp": "c++", "cloudcomputing": "cloud",
