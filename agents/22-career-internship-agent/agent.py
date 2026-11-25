@@ -16,6 +16,7 @@ Usage:
     python agent.py                                   # built-in sample resume + JD
     python agent.py --resume resume.pdf --job-desc job_posting.txt
     python agent.py --weeks 4 --json                  # 4-week plan, raw JSON output
+    python agent.py --find-jobs --skills "Python, SQL" [--ranking career]
 """
 
 import argparse
@@ -28,11 +29,12 @@ import re
 import statistics
 import sys
 import time
+import unicodedata
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Optional, TypedDict
+from typing import Literal, NamedTuple, Optional, TypedDict
 from unittest import mock
 
 from dotenv import load_dotenv
@@ -45,7 +47,7 @@ from langchain_core.exceptions import (
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import END, START, StateGraph
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 load_dotenv()
 
@@ -82,8 +84,15 @@ def ask(schema: type[BaseModel], system: str, user: str) -> BaseModel:
 
 
 def norm(skill: str) -> str:
-    """Normalize a skill name for comparison: 'REST APIs' -> 'restapis', 'C#' -> 'c#'."""
-    return re.sub(r"[^a-z0-9+#]", "", skill.lower())
+    """Normalize a skill name for comparison: 'REST APIs' -> 'restapis', 'C#' -> 'c#'.
+
+    Letters, digits, '+' and '#' are kept in any script, so Thai text ('ภาษาอังกฤษ') keeps its own
+    key instead of normalizing to '' and colliding with every other non-Latin name.
+    """
+    lowered = skill.lower()
+    if lowered.isascii():  # the common case, kept fast
+        return re.sub(r"[^a-z0-9+#]", "", lowered)
+    return "".join(ch for ch in lowered if ch in "+#" or unicodedata.category(ch)[0] in "LMN")
 
 
 # ---------------------------------------------------------------------------
@@ -323,18 +332,28 @@ def match_skills(state: CareerState) -> CareerState:
     return {"match": match}
 
 
-def default_severity(item: RequirementAssessment) -> str:
+def allowed_severities(item: RequirementAssessment) -> tuple[str, ...]:
+    """Severities GAP_PROMPT allows for an unmet requirement; the first is the default.
+
+    Only a nice-to-have leaves the LLM a choice (does it matter for the role's core work?).
+    A missing must-have is always blocking, a partial must-have always important.
+    """
     if item.importance == "must-have":
-        return "blocking" if item.status == "missing" else "important"
-    return "nice-to-have"
+        return ("blocking",) if item.status == "missing" else ("important",)
+    return ("nice-to-have", "important")
+
+
+def default_severity(item: RequirementAssessment) -> str:
+    return allowed_severities(item)[0]
 
 
 def reconcile_gaps(open_items: list[RequirementAssessment], returned: list[SkillGap],
                    eligibility: list[EligibilityCheck]) -> list[SkillGap]:
     """Exactly one gap per unmet requirement, ordered by severity.
 
-    Gaps the LLM invented or repeated are dropped, requirements it skipped are added back,
-    a missing must-have is always blocking, and so is an eligibility criterion that is not met.
+    Gaps the LLM invented or repeated are dropped, requirements it skipped are added back, and a
+    severity GAP_PROMPT does not allow is corrected (see allowed_severities). An eligibility
+    criterion that is not met is always blocking.
     """
     open_by_key = {canon(item.skill): item for item in open_items}
     gaps: dict[str, SkillGap] = {}
@@ -343,7 +362,8 @@ def reconcile_gaps(open_items: list[RequirementAssessment], returned: list[Skill
         item = open_by_key.get(key)
         if item is None or key in gaps:
             continue
-        severity = "blocking" if default_severity(item) == "blocking" else gap.severity
+        allowed = allowed_severities(item)
+        severity = gap.severity if gap.severity in allowed else allowed[0]
         gaps[key] = gap.model_copy(update={"skill": item.skill, "severity": severity})
     for key, item in open_by_key.items():
         if key not in gaps:
@@ -437,8 +457,7 @@ def build_graph():
 
 # Keys and values are norm()-ed names.
 ALIASES = {
-    "python 3.11": "python", "java 17": "java", "bash scripting": "bash",
-    "spring boot": "spring","postgres": "postgresql", "psql": "postgresql", "mssql": "sqlserver", "mongo": "mongodb",
+    "postgres": "postgresql", "psql": "postgresql", "mssql": "sqlserver", "mongo": "mongodb",
     "js": "javascript", "es6": "javascript", "ts": "typescript", "reactjs": "react", "vuejs": "vue",
     "angularjs": "angular", "node": "nodejs", "expressjs": "express", "html5": "html", "css3": "css",
     "golang": "go", "csharp": "c#", "cpp": "c++", "cloudcomputing": "cloud",
@@ -480,12 +499,24 @@ IMPLIES = {
 # Requirements that need every part: HTML alone is only partial for "HTML/CSS".
 COMPOUNDS = {"htmlcss": ("html", "css")}
 
+# Specializations are directional. Having the specific skill shows the broader one (met), but having only
+# the broader skill is partial credit for the specific one: Docker alone is not Docker Compose, whereas
+# Docker Compose is Docker. Each entry is merged into IMPLIES below.
+SPECIALIZES = {
+    "dockercompose": ["docker"],
+    "springboot": ["spring"],
+    "tsql": ["sql"],
+    "plsql": ["sql"],
+}
+for _specific, _broader in SPECIALIZES.items():
+    IMPLIES[_specific] = list(dict.fromkeys([*IMPLIES.get(_specific, []), *_broader]))
+
 # Marks an umbrella term from "Cloud (AWS/GCP)": general cloud experience is only partial
 # credit when the posting names specific providers.
 UMBRELLA = "~"
 
 FAMILIES = [
-    {"postgresql", "mysql", "sqlite", "sqlserver", "oracle", "mariadb"},
+    {"postgresql", "mysql", "sqlite", "sqlserver", "oracle", "mariadb", "tsql", "plsql"},
     {"mongodb", "firebase", "dynamodb"},
     {"django", "fastapi", "flask"},
     {"react", "vue", "angular", "svelte"},
@@ -507,42 +538,120 @@ KNOWN_SKILLS = (set(ALIASES.values()) | set(IMPLIES) | set(SIBLINGS)
                 | {s for implied in IMPLIES.values() for s in implied})
 
 # Filler words recruiters wrap around skill names: "Strong Python skills" -> "python".
+# FILLER is dropped wherever it appears. TRAILING_FILLER only describes the skill before it ("SQL databases",
+# "Java programming", "Bash scripting"), so it is dropped only at the end: in "Database design" the word
+# names the skill itself and stays.
 FILLER = {"strong", "solid", "basic", "good", "experience", "experienced", "with", "in", "of", "familiarity",
-          "familiar", "knowledge", "proficiency", "proficient", "understanding", "skills", "skill",
-          "development", "programming", "language", "databases", "database", "framework"}
+          "familiar", "knowledge", "proficiency", "proficient", "understanding"}
+TRAILING_FILLER = {"skills", "skill", "development", "programming", "language", "databases", "database",
+                   "framework", "scripting"}
 
 STATUS_RANK = {"met": 2, "partial": 1, "missing": 0}
 
 
-@lru_cache(maxsize=None)
+# Safeguards for untrusted text (user-supplied --jobs files, LLM output). Real skill names and requirements
+# are far shorter than these limits, so ordinary input is never affected.
+MAX_SKILL_CHARS = 300   # a longer skill or requirement string is cut off here
+MAX_ALTERNATIVES = 32   # at most this many "X or Y or ..." options are kept per requirement
+CACHE_SIZE = 50_000     # bounded, so a hostile catalog cannot grow the caches without limit
+
+# A standalone version number after a skill name: "3.11", "17", "v2", "3.x", "8+".
+VERSION_TOKEN = re.compile(r"v?\d+(?:\.\d+)*(?:\.x)?\+?")
+
+
+@lru_cache(maxsize=CACHE_SIZE)
 def canon(skill: str) -> str:
-    """Canonical skill key: 'Strong Python skills' -> 'python', 'Postgres' -> 'postgresql'."""
+    """Canonical skill key: 'Strong Python skills' -> 'python', 'Postgres' -> 'postgresql'.
+
+    Versions are ignored ('Python 3.11', 'Java17' -> 'python', 'java'): the matcher judges which skill
+    a person has, not which release, and a version never makes a different skill.
+    """
+    skill = skill[:MAX_SKILL_CHARS]
     words = [w for w in skill.lower().split() if w not in FILLER]
+    words = [w for w in words if not VERSION_TOKEN.fullmatch(w)] or words  # a lone number is kept as it is
+    while len(words) > 1 and words[-1] in TRAILING_FILLER:
+        words.pop()
     key = norm(" ".join(words)) or norm(skill)
-    return ALIASES.get(key, key)
+    key = ALIASES.get(key, key)
+    if key not in KNOWN_SKILLS:
+        # A version glued to a name the tables know: 'python3', 'java17', 'vue3'. Names that merely end in
+        # a digit ('s3', 'ec2') stay as they are, because what is left of them is not a known skill.
+        base = key.rstrip("0123456789")
+        if base and base != key:
+            base = ALIASES.get(base, base)
+            if base in KNOWN_SKILLS:
+                return base
+    return key
 
 
-@lru_cache(maxsize=None)
+def _split_parenthetical(text: str) -> Optional[tuple[str, str]]:
+    """('Cloud ', 'AWS/GCP') for 'Cloud (AWS/GCP)', or None when text has no such shape.
+
+    Accepts exactly what the regex r"(.*?)\\((.+)\\)\\s*" accepted, in one pass. That regex backtracked:
+    text such as "((((((x" took quadratic time (20k characters: 1.1 s).
+    """
+    core = text.rstrip()
+    if "\n" in core or not core.endswith(")"):
+        return None
+    opening = core.find("(")
+    if opening < 0 or opening >= len(core) - 2:  # no "(", or nothing between it and the final ")"
+        return None
+    return core[:opening], core[opening + 1:-1]
+
+
+def _split_options(body: str) -> list[str]:
+    """Split 'FastAPI or Django', 'AWS/GCP', 'A, B' and 'A | B' into their options."""
+    options = []
+    for chunk in re.split(r"[/,|]", body):
+        # Collapse whitespace first: matching r"\s+or\s+" against a long run of spaces is quadratic.
+        options.extend(re.split(r" or ", re.sub(r"\s+", " ", chunk), flags=re.IGNORECASE))
+    return options
+
+
+@lru_cache(maxsize=CACHE_SIZE)
 def alternatives(requirement: str) -> tuple[str, ...]:
     """Canonical skills that each satisfy a requirement.
 
     'FastAPI or Django' -> (fastapi, django); 'Cloud (AWS/GCP)' -> (aws, gcp, ~cloud), where
     ~cloud gives partial credit only; 'CI/CD' and 'HTML/CSS' stay one skill because they are known names.
+    Runs in linear time; text beyond MAX_SKILL_CHARS and options beyond MAX_ALTERNATIVES are ignored.
     """
+    requirement = requirement[:MAX_SKILL_CHARS]
     whole = canon(requirement)
     if whole in KNOWN_SKILLS:
         return (whole,)
     umbrella = []
-    m = re.fullmatch(r"(.*?)\((.+)\)\s*", requirement)
-    if m:
-        outer = canon(m.group(1))
+    split = _split_parenthetical(requirement)
+    if split:
+        outer, body = split
+        outer = canon(outer)
         if outer in KNOWN_SKILLS:
             umbrella.append(UMBRELLA + outer)
-        body = m.group(2)
     else:
         body = requirement
-    parts = [canon(p) for p in re.split(r"\s+or\s+|/|,|\|", body, flags=re.IGNORECASE)] + umbrella
-    return tuple(dict.fromkeys(p for p in parts if p)) or (whole,)
+    options = list(dict.fromkeys(p for p in map(canon, _split_options(body)) if p))[:MAX_ALTERNATIVES]
+    if "/" in body and len(options) > 1 and not any(o in KNOWN_SKILLS for o in options):
+        # No part is a known skill, so the slash may belong to the name ('A/B testing', 'Pub/Sub'):
+        # keep the whole name as one more option, so a candidate who lists it exactly still matches.
+        options.append(canon(body))
+    return tuple(dict.fromkeys(options + umbrella)) or (whole,)
+
+
+class Verdict(NamedTuple):
+    """A requirement judged against one candidate: the status, how it was matched, and the evidence.
+
+    kind says WHY the status holds, so equivalent and merely related skills are never confused:
+      exact       the candidate lists the skill under its canonical name ("Python" for Python)
+      equivalent  listed under another spelling or version ("Postgres", "Python 3.11", "ReactJS")
+      implied     shown by a more specific skill that is listed ("PostgreSQL" shows SQL; "Docker Compose" shows Docker)
+      related     only a related skill: a sibling tool, a broader skill, an umbrella term or half of a compound
+      missing     nothing relevant is listed
+    exact, equivalent and implied are "met"; related is "partial".
+    """
+
+    status: str
+    kind: str
+    evidence: str
 
 
 class SkillMatcher:
@@ -552,9 +661,15 @@ class SkillMatcher:
         # Map every skill the candidate demonstrates to the listed skill that shows it.
         # Listed skills go in first, so an inferred skill never hides a listed one.
         self.has: dict[str, str] = {}
+        self._spelling: dict[str, str] = {}  # listed skill -> "exact" (canonical name) or "equivalent"
         for s in skills:
-            if canon(s):
-                self.has.setdefault(canon(s), s.strip())
+            key = canon(s)
+            if key:
+                self.has.setdefault(key, s.strip())
+                if norm(s) == key:
+                    self._spelling[key] = "exact"
+                else:
+                    self._spelling.setdefault(key, "equivalent")
         self.listed = set(self.has)
         stack = list(self.has.items())
         while stack:
@@ -567,30 +682,44 @@ class SkillMatcher:
             if compound not in self.has and all(p in self.has for p in parts):
                 self.has[compound] = " + ".join(dict.fromkeys(self.has[p] for p in parts))
         self._cache: dict[tuple[str, ...], tuple[str, str]] = {}
+        self._kinds: dict[tuple[str, ...], str] = {}
 
-    def _judge_one(self, skill: str) -> tuple[str, str]:
+    def _judge_one(self, skill: str) -> Verdict:
         if skill.startswith(UMBRELLA):
             general = skill[len(UMBRELLA):]
             if general in self.has:
-                return "partial", f"Lists {self.has[general]}, but not one of the named options"
-            return "missing", "No matching or related skill listed"
+                return Verdict("partial", "related", f"Lists {self.has[general]}, but not one of the named options")
+            return Verdict("missing", "missing", "No matching or related skill listed")
         if skill in COMPOUNDS and skill not in self.has:
             have = [self.has[p] for p in COMPOUNDS[skill] if p in self.has]
             if have:
-                return "partial", f"Lists only {', '.join(have)}"
+                return Verdict("partial", "related", f"Lists only {', '.join(have)}")
         if skill in self.has:
-            implied = "" if skill in self.listed else ", which implies it"
-            return "met", f"Lists {self.has[skill]}{implied}"
+            if skill in self.listed:
+                return Verdict("met", self._spelling[skill], f"Lists {self.has[skill]}")
+            return Verdict("met", "implied", f"Lists {self.has[skill]}, which implies it")
+        # Directional: a broader skill is only partial credit for the specific one it does not show.
+        for broader in SPECIALIZES.get(skill, ()):
+            if broader in self.has:
+                return Verdict("partial", "related", f"Lists {self.has[broader]}, a broader skill than the one required")
         for sibling in sorted(SIBLINGS.get(skill, ())):
             if sibling in self.has:
-                return "partial", f"Related skill: {self.has[sibling]}"
-        return "missing", "No matching or related skill listed"
+                return Verdict("partial", "related", f"Related skill: {self.has[sibling]}")
+        return Verdict("missing", "missing", "No matching or related skill listed")
 
     def judge(self, alts: tuple[str, ...]) -> tuple[str, str]:
         """(status, evidence) for a requirement; any one alternative is enough."""
-        if alts not in self._cache:
-            self._cache[alts] = max((self._judge_one(a) for a in alts), key=lambda v: STATUS_RANK[v[0]])
-        return self._cache[alts]
+        cached = self._cache.get(alts)
+        if cached is None:
+            best = max((self._judge_one(a) for a in alts), key=lambda v: STATUS_RANK[v.status])
+            self._kinds[alts] = best.kind
+            cached = self._cache[alts] = (best.status, best.evidence)
+        return cached
+
+    def judge_detailed(self, alts: tuple[str, ...]) -> Verdict:
+        """Like judge(), plus the kind of match (exact / equivalent / implied / related / missing)."""
+        status, evidence = self.judge(alts)
+        return Verdict(status, self._kinds[alts], evidence)
 
 
 class JobPosting(BaseModel):
@@ -600,6 +729,8 @@ class JobPosting(BaseModel):
     location: Optional[str] = None
     must_have_skills: list[str] = Field(default_factory=list)
     nice_to_have_skills: list[str] = Field(default_factory=list)
+    family: Optional[str] = Field(default=None, description="Career path(s), e.g. 'backend' or 'frontend,backend'; "
+                                                            "inferred from the skills and title when omitted")
 
 
 class JobMatch(BaseModel):
@@ -659,6 +790,369 @@ class JobIndex:
         )
 
 
+# ---------------------------------------------------------------------------
+# Career-aware ranking (opt-in): find_jobs(..., ranking="career")
+# ---------------------------------------------------------------------------
+#
+# JobIndex.rank() gives every requirement the same standing, so a generic skill (Git, Python, SQL) earns as
+# much as a specialised one and unrelated roles climb the list on shared basics alone. The career ranker adds
+# the missing structure, as four components in [0, 1] combined with configurable weights:
+#   technical     skill coverage, each requirement weighted by how SPECIFIC its skill is to one career path
+#   domain        how close the job's career path is to the candidate's (families + DOMAIN_AFFINITY)
+#   experience    skills shown IN USE (projects, experience), or depth in the job's path when only a list is known
+#   transferable  coverage of the GENERIC part of the requirements, so shared basics still count, but capped
+# It is plain data and arithmetic: no LLM, no randomness, and ties break the same way every time.
+# The tables and weights below are initial, hand-set values: tune them on your own labelled data.
+
+DOMAINS = ("backend", "frontend", "mobile", "data", "ml", "devops", "qa", "embedded", "design", "security", "game")
+_DOMAIN_INDEX = {d: i for i, d in enumerate(DOMAINS)}
+
+
+def _tag(domains: str, *skills: str) -> dict[str, tuple[str, ...]]:
+    return {skill: tuple(domains.split()) for skill in skills}
+
+
+# Which career paths a skill is evidence for (its weight is split evenly). A skill that serves many paths is
+# "generic"; one that serves a single path is "specific". Keys are canon() names.
+SKILL_DOMAINS: dict[str, tuple[str, ...]] = {
+    **_tag("backend", "restapi", "django", "flask", "fastapi", "nodejs", "express", "mongodb", "dynamodb",
+           "spring", "springboot"),
+    **_tag("frontend", "html", "css", "htmlcss", "react", "vue", "angular", "svelte", "nextjs"),
+    **_tag("frontend backend", "javascript", "typescript"),
+    **_tag("backend data", "sql", "postgresql", "mysql", "sqlite", "sqlserver", "oracle", "mariadb", "tsql", "plsql"),
+    **_tag("backend mobile", "firebase", "kotlin", "java"),
+    **_tag("backend data ml devops qa", "python"),
+    **_tag("game backend", "c#"),
+    **_tag("embedded", "c", "microcontrollers", "rtos", "pcbdesign"),
+    **_tag("embedded game", "c++"),
+    **_tag("mobile", "swift", "swiftui", "iossdk", "androidsdk", "jetpackcompose"),
+    **_tag("devops backend", "docker", "dockercompose"),
+    **_tag("devops", "kubernetes", "terraform"),
+    **_tag("devops backend data", "aws", "gcp", "azure", "cloud"),
+    **_tag("devops security backend embedded", "linux"),
+    **_tag("devops security", "bash"),
+    **_tag("devops qa", "cicd", "githubactions", "jenkins", "gitlabci"),
+    **_tag("qa", "softwaretesting", "selenium", "cypress", "playwright", "junit", "pytest"),
+    **_tag("data", "pandas", "tableau", "powerbi", "looker", "excel", "etl", "spark", "airflow", "dbt"),
+    **_tag("data ml", "numpy", "statistics", "jupyter", "scikitlearn"),
+    **_tag("ml", "machinelearning", "deeplearning", "nlp", "pytorch", "tensorflow", "keras", "jax"),
+    **_tag("design", "figma", "uidesign", "userresearch", "prototyping"),
+    **_tag("security devops", "networking"),
+    **_tag("security", "wireshark", "penetrationtesting"),
+    **_tag("game", "unity", "unreal", "godot", "blender"),
+    **{skill: DOMAINS for skill in ("git", "github", "gitlab", "bitbucket")},  # every path uses version control
+}
+UNKNOWN_SPECIFICITY = 0.7  # a tool the table does not know is more likely specific than generic
+SPECIFICITY_FLOOR = 0.1    # so a job made only of generic requirements still has something to score
+
+# Career families: paths in the same family are related by default; DOMAIN_AFFINITY overrides pairs explicitly
+# (symmetric). 1.0 would mean the same path and 0.0 unrelated.
+CAREER_FAMILIES = {
+    "software": ("backend", "frontend", "mobile", "qa"),
+    "data-ai": ("data", "ml"),
+    "infrastructure": ("devops", "security"),
+    "design": ("design", "frontend"),
+    "systems": ("embedded", "game"),
+}
+FAMILY_AFFINITY = 0.35
+DOMAIN_AFFINITY = {
+    ("backend", "frontend"): 0.5, ("backend", "devops"): 0.45, ("backend", "data"): 0.45, ("backend", "qa"): 0.45,
+    ("data", "ml"): 0.6, ("frontend", "design"): 0.5, ("frontend", "mobile"): 0.4, ("devops", "security"): 0.4,
+    ("devops", "qa"): 0.35, ("ml", "backend"): 0.25, ("data", "devops"): 0.25, ("embedded", "security"): 0.25,
+    ("embedded", "devops"): 0.25,
+}
+
+# Words in a job title that name a career path (lowercase tokens).
+TITLE_HINTS = {
+    "backend": ("backend",), "back": ("backend",), "frontend": ("frontend",), "front": ("frontend",),
+    "stack": ("frontend", "backend"), "fullstack": ("frontend", "backend"),
+    "android": ("mobile",), "ios": ("mobile",), "mobile": ("mobile",),
+    "data": ("data",), "analyst": ("data",), "analytics": ("data",), "scientist": ("data", "ml"),
+    "machine": ("ml",), "learning": ("ml",), "ml": ("ml",), "ai": ("ml",),
+    "devops": ("devops",), "cloud": ("devops",), "sre": ("devops",), "infrastructure": ("devops",),
+    "qa": ("qa",), "test": ("qa",), "testing": ("qa",), "embedded": ("embedded",), "firmware": ("embedded",),
+    "ux": ("design",), "ui": ("design",), "design": ("design",), "designer": ("design",),
+    "security": ("security",), "cybersecurity": ("security",), "game": ("game",), "games": ("game",),
+}
+TITLE_WEIGHT = 3.0     # a title naming a path counts like this much requirement weight
+DEPTH_SATURATION = 3   # specific skills in one path that count as full depth there
+NEUTRAL_DOMAIN = 0.5   # domain score when there is no evidence either way
+
+# Words that name a skill but are also ordinary English: not read as skills inside free resume text.
+AMBIGUOUS_IN_TEXT = {"rest", "spring", "express", "swift", "unity", "compose", "shell", "testing", "networks",
+                     "stats", "node", "cloud", "go"}
+MAX_TEXT_CHARS = 5_000
+_WORD = re.compile(r"[A-Za-z0-9+#.]+")
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def skill_specificity(skill: str) -> float:
+    """1.0 for a skill that points at one career path, falling to 0.0 for one every path uses (Git)."""
+    skill = skill[len(UMBRELLA):] if skill.startswith(UMBRELLA) else skill
+    domains = SKILL_DOMAINS.get(skill)
+    if not domains:
+        return UNKNOWN_SPECIFICITY
+    return 1 - math.log(len(domains)) / math.log(len(DOMAINS))
+
+
+def domain_affinity_matrix() -> list[list[float]]:
+    """DOMAINS x DOMAINS: 1.0 on the diagonal, family and explicit affinities elsewhere."""
+    n = len(DOMAINS)
+    matrix = [[1.0 if a == b else 0.0 for b in range(n)] for a in range(n)]
+    for members in CAREER_FAMILIES.values():
+        for a in members:
+            for b in members:
+                if a != b:
+                    i, j = _DOMAIN_INDEX[a], _DOMAIN_INDEX[b]
+                    matrix[i][j] = max(matrix[i][j], FAMILY_AFFINITY)
+    for (a, b), value in DOMAIN_AFFINITY.items():
+        matrix[_DOMAIN_INDEX[a]][_DOMAIN_INDEX[b]] = matrix[_DOMAIN_INDEX[b]][_DOMAIN_INDEX[a]] = value
+    return matrix
+
+
+class RankingWeights(BaseModel):
+    """Relative importance of the four career-fit components. They are normalised to sum to 1 when used,
+    so 40/25/20/15 and 0.40/0.25/0.20/0.15 are the same. These are initial values, not tuned optima."""
+
+    technical: float = Field(0.40, ge=0, allow_inf_nan=False)
+    domain: float = Field(0.25, ge=0, allow_inf_nan=False)
+    experience: float = Field(0.20, ge=0, allow_inf_nan=False)
+    transferable: float = Field(0.15, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _some_weight_is_positive(self):
+        if self.technical + self.domain + self.experience + self.transferable <= 0:
+            raise ValueError("at least one weight must be positive")
+        return self
+
+    def normalized(self) -> "RankingWeights":
+        total = self.technical + self.domain + self.experience + self.transferable
+        return RankingWeights(technical=self.technical / total, domain=self.domain / total,
+                              experience=self.experience / total, transferable=self.transferable / total)
+
+    @classmethod
+    def parse(cls, text: str) -> "RankingWeights":
+        """'technical=0.5,domain=0.2' (the rest keep their defaults) or four numbers in the order
+        technical, domain, experience, transferable: '40,25,20,15'."""
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        try:
+            if all("=" not in p for p in parts):
+                if len(parts) != 4:
+                    raise ValueError("give four numbers (technical, domain, experience, transferable) or name=value pairs")
+                return cls(**dict(zip(cls.model_fields, map(float, parts))))
+            values = {}
+            for part in parts:
+                name, _, value = part.partition("=")
+                if name.strip() not in cls.model_fields:
+                    raise ValueError(f"unknown weight '{name.strip()}'; use technical, domain, experience, transferable")
+                values[name.strip()] = float(value)
+            return cls(**values)
+        except ValueError as e:
+            raise ValueError(f"bad weights '{text}': {e}") from None
+
+
+DEFAULT_RANKING_WEIGHTS = RankingWeights()
+RANKING_MODES = ("skills", "career")
+
+
+class CareerBreakdown(BaseModel):
+    """Why a job got its career-fit score. Components are in [0, 1]; total is their weighted sum."""
+
+    technical: float
+    domain: float
+    experience: float
+    transferable: float
+    total: float
+    skill_score: int = Field(description="The plain skill-coverage score JobIndex.rank() would give")
+    candidate_paths: list[str]
+    job_paths: list[str]
+
+
+class CareerMatch(JobMatch):
+    """A JobMatch ranked by career fit: `score` is the career-fit total (0-100); see `career` for the parts."""
+
+    career: CareerBreakdown
+
+
+def _skills_in_text(text: str) -> list[str]:
+    """Skills named in free text (project descriptions, experience), found as 1-3 word phrases."""
+    words = _WORD.findall(text[:MAX_TEXT_CHARS])
+    found = []
+    for size in (3, 2, 1):
+        for i in range(len(words) - size + 1):
+            gram = " ".join(words[i:i + size])
+            key = canon(gram)
+            if len(key) > 2 and key in KNOWN_SKILLS and not (size == 1 and gram.lower().strip(".") in AMBIGUOUS_IN_TEXT):
+                found.append(gram)
+    return found
+
+
+EVIDENCE_WEIGHTS = {
+    "work_experience": 1.00,
+    "project": 0.85,
+    "coursework": 0.65,
+    "activity": 0.50,
+}
+
+
+def applied_skill_evidence(profile: ResumeProfile) -> dict[str, tuple[str, float]]:
+    """Map canonical skill to its strongest evidence source; repeated mentions do not add credit."""
+    evidence: dict[str, tuple[str, float]] = {}
+
+    def add(skills: list[str], source: str) -> None:
+        weight = EVIDENCE_WEIGHTS[source]
+        for skill in skills:
+            key = canon(skill)
+            if key and (key not in evidence or weight > evidence[key][1]):
+                evidence[key] = (source, weight)
+
+    for project in profile.projects:
+        add(project.skills_used, "project")
+        add(_skills_in_text(project.description), "project")
+    for item in profile.experience:
+        add(_skills_in_text(item), "work_experience")
+    for item in profile.education:
+        add(_skills_in_text(item), "coursework")
+    for item in profile.activities:
+        add(_skills_in_text(item), "activity")
+    return evidence
+
+
+def applied_skills(profile: ResumeProfile) -> list[str]:
+    """Compatibility helper: skills with evidence beyond the skills-section list."""
+    return list(applied_skill_evidence(profile))
+
+
+class _JobFeatures(NamedTuple):
+    rows: tuple          # (alternatives, technical weight, transferable weight, is_must_have) per requirement
+    technical_total: float
+    transferable_total: float
+    domains: tuple       # the job's share in each of DOMAINS (sums to 1, or all 0 when unknown)
+    expanded: tuple      # domains spread through the affinity matrix, so domain alignment is one dot product
+
+
+class CareerRanker:
+    """Ranks a catalog by career fit. Requirements and job features are prepared once; each search is a scan."""
+
+    def __init__(self, jobs: list[JobPosting], weights: Optional[RankingWeights] = None):
+        self.weights = (weights or DEFAULT_RANKING_WEIGHTS).normalized()
+        self._index = JobIndex(jobs)
+        affinity = domain_affinity_matrix()
+        self._jobs: list[_JobFeatures] = []
+        for job, requirements in zip(jobs, self._index._requirements):
+            rows, technical_total, transferable_total = [], 0.0, 0.0
+            mass = [0.0] * len(DOMAINS)
+            for _skill, importance, alts in requirements:
+                weight = IMPORTANCE_WEIGHT[importance]
+                specificity = statistics.fmean(skill_specificity(a) for a in alts)
+                technical_weight = weight * max(specificity, SPECIFICITY_FLOOR)
+                transferable_weight = weight * (1 - specificity)
+                rows.append((alts, technical_weight, transferable_weight, importance == "must-have"))
+                technical_total += technical_weight
+                transferable_total += transferable_weight
+                for alt in alts:
+                    domains = SKILL_DOMAINS.get(alt[len(UMBRELLA):] if alt.startswith(UMBRELLA) else alt, ())
+                    for d in domains:  # a generic skill adds almost nothing: its specificity is near 0
+                        mass[_DOMAIN_INDEX[d]] += weight * specificity / len(alts) / len(domains)
+            shares = self._job_shares(job, mass)
+            expanded = tuple(sum(shares[b] * affinity[a][b] for b in range(len(DOMAINS))) for a in range(len(DOMAINS)))
+            self._jobs.append(_JobFeatures(tuple(rows), technical_total, transferable_total, shares, expanded))
+
+    @staticmethod
+    def _job_shares(job: JobPosting, mass: list[float]) -> tuple:
+        named = [d for d in re.split(r"[,/\s]+", (job.family or "").lower()) if d in _DOMAIN_INDEX]
+        if named:  # an explicit family overrides inference
+            mass = [1.0 if d in named else 0.0 for d in DOMAINS]
+        else:
+            hinted = sorted({d for token in re.findall(r"[a-z]+", job.title.lower()) for d in TITLE_HINTS.get(token, ())})
+            for d in hinted:
+                mass[_DOMAIN_INDEX[d]] += TITLE_WEIGHT / len(hinted)
+        total = sum(mass)
+        return tuple(m / total for m in mass) if total else tuple(mass)
+
+    @staticmethod
+    def _candidate(matcher: SkillMatcher) -> tuple[list[float], list[float]]:
+        """(share of the candidate's skills in each path, depth 0-1 in each path)."""
+        mass, specific = [0.0] * len(DOMAINS), [0] * len(DOMAINS)
+        for skill in sorted(matcher.listed):  # sorted: float sums must not depend on set order
+            domains = SKILL_DOMAINS.get(skill)
+            if not domains:
+                continue
+            specificity = skill_specificity(skill)
+            for d in domains:
+                mass[_DOMAIN_INDEX[d]] += specificity / len(domains)
+                specific[_DOMAIN_INDEX[d]] += specificity >= 0.5
+        total = sum(mass)
+        shares = [m / total for m in mass] if total else mass
+        return shares, [min(1.0, n / DEPTH_SATURATION) for n in specific]
+
+    @staticmethod
+    def _paths(shares) -> list[str]:
+        order = sorted(range(len(DOMAINS)), key=lambda i: (-shares[i], i))
+        return [DOMAINS[i] for i in order if shares[i] >= 0.2][:3]
+
+    def rank(self, skills: list[str], top: Optional[int] = 5, profile: Optional[ResumeProfile] = None) -> list[CareerMatch]:
+        """Best career fit first; ties go to technical fit, then fewer missing must-haves, then catalog order.
+
+        Pass the resume profile to let skills shown in projects and experience count toward `experience`.
+        With a profile, `experience` always blends in that evidence, even when there is none, so adding a
+        project to a resume can only raise it. Without one (--skills), it is skill depth alone."""
+        matcher = SkillMatcher(skills)
+        evidence = applied_skill_evidence(profile) if profile else {}
+        evidence_matchers = {
+            source: SkillMatcher([key for key, (kind, _weight) in evidence.items() if kind == source])
+            for source in EVIDENCE_WEIGHTS
+        } if profile is not None else {}
+        shares, depth = self._candidate(matcher)
+        has_candidate_domain = any(shares)
+        w = self.weights
+        scored = []
+        for i, job in enumerate(self._jobs):
+            technical_sum = transferable_sum = evidence_sum = 0.0
+            missing_must = 0
+            for alts, technical_weight, transferable_weight, is_must in job.rows:
+                status = matcher.judge(alts)[0]
+                credit = STATUS_CREDIT[status]
+                technical_sum += technical_weight * credit
+                transferable_sum += transferable_weight * credit
+                evidence_credit = 0.0
+                for source, source_matcher in evidence_matchers.items():
+                    evidence_credit = max(
+                        evidence_credit,
+                        STATUS_CREDIT[source_matcher.judge(alts)[0]] * EVIDENCE_WEIGHTS[source],
+                    )
+                evidence_sum += technical_weight * evidence_credit
+                missing_must += is_must and status == "missing"
+            technical = technical_sum / job.technical_total if job.technical_total else 0.0
+            # No generic requirement to judge: shared basics say nothing, so fall back to the technical fit.
+            transferable = transferable_sum / job.transferable_total if job.transferable_total > 1e-9 else technical
+            if has_candidate_domain and any(job.domains):
+                domain = sum(c * e for c, e in zip(shares, job.expanded))
+            else:
+                domain = NEUTRAL_DOMAIN
+            depth_experience = sum(d * s for d, s in zip(depth, job.domains))
+            if evidence_matchers and job.technical_total:
+                evidence_experience = evidence_sum / job.technical_total
+                experience = 0.25 * depth_experience + 0.75 * evidence_experience
+            else:
+                experience = depth_experience
+            total = w.technical * technical + w.domain * domain + w.experience * experience + w.transferable * transferable
+            key = (-round(total, 9), -round(technical, 9), missing_must, i)  # rounding hides float noise in ties
+            scored.append((key, (technical, domain, experience, transferable, total)))
+        best = heapq.nsmallest(top, scored) if top is not None else sorted(scored)
+        results = []
+        for key, (technical, domain, experience, transferable, total) in best:
+            base = self._index._explain(key[3], matcher)
+            results.append(CareerMatch(
+                job=base.job, score=round(100 * total), missing_must_haves=base.missing_must_haves,
+                assessments=base.assessments,
+                career=CareerBreakdown(
+                    technical=round(technical, 3), domain=round(domain, 3), experience=round(experience, 3),
+                    transferable=round(transferable, 3), total=round(total, 4), skill_score=base.score,
+                    candidate_paths=self._paths(shares), job_paths=self._paths(self._jobs[key[3]].domains))))
+        return results
+
+
 def rerank_with_llm(matches: list[JobMatch], profile: ResumeProfile, workers: int = 4) -> list[JobMatch]:
     """Re-check matches with the Matching Agent (one LLM call each, run in parallel)."""
 
@@ -676,16 +1170,26 @@ def rerank_with_llm(matches: list[JobMatch], profile: ResumeProfile, workers: in
 
 
 def find_jobs(skills: list[str], jobs: list[JobPosting], top: int = 5, rerank: int = 0,
-              profile: Optional[ResumeProfile] = None, timings: Optional[dict] = None) -> list[JobMatch]:
+              profile: Optional[ResumeProfile] = None, timings: Optional[dict] = None,
+              ranking: str = "skills", weights: Optional[RankingWeights] = None) -> list[JobMatch]:
     """Rank jobs by skill fit; with rerank > 0, the top `rerank` are re-checked by the LLM.
+
+    ranking="skills" (the default) scores skill coverage only. ranking="career" also weighs career path,
+    experience and transferable skills (see CareerRanker); `weights` tunes it, and `profile` lets projects
+    and experience count as evidence.
 
     Pass a dict as `timings` to get the time spent in each stage (ms).
     """
     if top < 1 or rerank < 0:
         raise ValueError(f"top must be at least 1 and rerank at least 0 (got top={top}, rerank={rerank})")
+    if ranking not in RANKING_MODES:
+        raise ValueError(f"ranking must be one of {RANKING_MODES} (got {ranking!r})")
     timings = {} if timings is None else timings
     start = time.perf_counter()
-    matches = JobIndex(jobs).rank(skills, top=max(top, rerank))
+    if ranking == "career":
+        matches = CareerRanker(jobs, weights).rank(skills, top=max(top, rerank), profile=profile)
+    else:
+        matches = JobIndex(jobs).rank(skills, top=max(top, rerank))
     timings["rank_ms"] = (time.perf_counter() - start) * 1000
     if rerank and matches:
         start = time.perf_counter()
@@ -789,14 +1293,29 @@ SEVERITY_ICON = {"blocking": "🔴", "important": "🟠", "nice-to-have": "🟢"
 ELIGIBILITY_ICON = {"met": "✅", "not-met": "❌", "unclear": "❔"}
 
 
+DOCUMENT_SUFFIXES = {".pdf", ".txt", ".text", ".md", ".markdown", ".rtf", ".doc", ".docx", ".json"}
+
+
+def looks_like_path(source: str) -> bool:
+    """One short line ending in a document extension: 'resume.pdf', 'docs/job posting.txt'."""
+    text = source.strip()
+    return 0 < len(text) <= 260 and "\n" not in text and Path(text).suffix.lower() in DOCUMENT_SUFFIXES
+
+
 def read_text(source: str) -> str:
-    """Read a .pdf or text file, or treat the argument itself as raw text."""
+    """Read a .pdf or text file, or treat the argument itself as raw text.
+
+    Raises FileNotFoundError for a missing file that is clearly a path ('resumee.pdf'), so a typo is
+    reported instead of being analyzed as if it were the resume.
+    """
     path = Path(source)
     try:
         is_file = path.is_file()
     except OSError:  # e.g. ENAMETOOLONG: raw text longer than a file name can be
         is_file = False
     if not is_file:
+        if looks_like_path(source):
+            raise FileNotFoundError(f"File not found: {source}")
         return source
     if path.suffix.lower() == ".pdf":
         from pypdf import PdfReader
@@ -882,6 +1401,11 @@ def print_job_matches(matches: list[JobMatch], n_jobs: int, skills: list[str], t
         where = " · ".join(x for x in (m.job.company, m.job.location) if x)
         score = f"{m.score}/100" if m.llm_score is None else f"{m.llm_score}/100 (LLM re-check; quick score {m.score})"
         print(f"\n {rank}. {m.job.title}" + (f" — {where}" if where else "") + f"\n    📊 {score}")
+        if isinstance(m, CareerMatch):
+            c = m.career
+            print(f"    🧭 career fit: technical {c.technical:.2f} · domain {c.domain:.2f} · experience "
+                  f"{c.experience:.2f} · transferable {c.transferable:.2f}  (skills only: {c.skill_score}/100)")
+            print(f"    🛤️  paths: you {', '.join(c.candidate_paths) or '?'} → job {', '.join(c.job_paths) or '?'}")
         print("    " + "  ".join(f"{STATUS_ICON[a.status]} {a.skill}" for a in m.assessments))
         if m.missing_must_haves:
             print(f"    ⚠️  Missing must-haves: {', '.join(m.missing_must_haves)}")
@@ -998,7 +1522,7 @@ def ranking_metrics(ranked: list[str], labels: dict[str, int], k: int = 5) -> di
 
 
 def evaluate(jobs: list[JobPosting] = SAMPLE_JOBS) -> dict:
-    """Score the matcher (and an exact-name baseline) against the hand labels."""
+    """Compare skill-only, career-aware, and exact-name ranking on identical labelled cases."""
     misses, baseline_correct = [], 0
     for skills, requirement, expected in REQUIREMENT_CASES:
         got = SkillMatcher(skills).judge(alternatives(requirement))[0]
@@ -1007,13 +1531,24 @@ def evaluate(jobs: list[JobPosting] = SAMPLE_JOBS) -> dict:
         exact = "met" if requirement.strip().lower() in {s.strip().lower() for s in skills} else "missing"
         baseline_correct += exact == expected
 
-    index = JobIndex(jobs)
-    per_candidate, matcher_rows, baseline_rows = {}, [], []
+    skill_index = JobIndex(jobs)
+    career_ranker = CareerRanker(jobs)
+    per_candidate, skill_rows, career_rows, baseline_rows = {}, [], [], []
     for name, (skills, labels) in EVAL_CANDIDATES.items():
-        ranked = [m.job.id for m in index.rank(skills, top=None)]
-        matcher_rows.append(ranking_metrics(ranked, labels))
-        baseline_rows.append(ranking_metrics(baseline_rank(jobs, skills), labels))
-        per_candidate[name] = {"top3": ranked[:3], **matcher_rows[-1]}
+        skill_ranked = [m.job.id for m in skill_index.rank(skills, top=None)]
+        career_ranked = [m.job.id for m in career_ranker.rank(skills, top=None)]
+        baseline_ranked = baseline_rank(jobs, skills)
+        skill_metrics = ranking_metrics(skill_ranked, labels)
+        career_metrics = ranking_metrics(career_ranked, labels)
+        baseline_metrics = ranking_metrics(baseline_ranked, labels)
+        skill_rows.append(skill_metrics)
+        career_rows.append(career_metrics)
+        baseline_rows.append(baseline_metrics)
+        per_candidate[name] = {
+            "skills_top3": skill_ranked[:3], "career_top3": career_ranked[:3],
+            "baseline_top3": baseline_ranked[:3],
+            "skills": skill_metrics, "career": career_metrics, "baseline": baseline_metrics,
+        }
 
     def mean(rows):
         return {metric: statistics.mean(row[metric] for row in rows) for metric in rows[0]}
@@ -1022,9 +1557,8 @@ def evaluate(jobs: list[JobPosting] = SAMPLE_JOBS) -> dict:
     return {
         "requirement_accuracy": (n - len(misses)) / n,
         "baseline_requirement_accuracy": baseline_correct / n,
-        "requirement_cases": n,
-        "misses": misses,
-        "ranking": {"matcher": mean(matcher_rows), "baseline": mean(baseline_rows)},
+        "requirement_cases": n, "misses": misses,
+        "ranking": {"skills": mean(skill_rows), "career": mean(career_rows), "baseline": mean(baseline_rows)},
         "per_candidate": per_candidate,
     }
 
@@ -1038,13 +1572,17 @@ def print_eval(report: dict) -> None:
         print(f"  ✗ {', '.join(skills)} vs '{requirement}': expected {expected}, got {got}")
 
     print(f"\n{line}\n📏 RANKING QUALITY ({len(report['per_candidate'])} candidates × {len(SAMPLE_JOBS)} jobs)\n{line}")
-    matcher, baseline = report["ranking"]["matcher"], report["ranking"]["baseline"]
-    print(f"  {'metric':<10}{'matcher':>9}{'baseline':>10}")
-    for metric in matcher:
-        print(f"  {metric:<10}{matcher[metric]:>9.2f}{baseline[metric]:>10.2f}")
+    rankings = report["ranking"]
+    print(f"  {'metric':<10}{'skills':>9}{'career':>9}{'baseline':>10}")
+    for metric in rankings["skills"]:
+        print(f"  {metric:<10}{rankings['skills'][metric]:>9.2f}"
+              f"{rankings['career'][metric]:>9.2f}{rankings['baseline'][metric]:>10.2f}")
     print()
     for name, row in report["per_candidate"].items():
-        print(f"  {name:<14} NDCG@5 {row['NDCG@5']:.2f}  top 3: {', '.join(row['top3'])}")
+        print(f"  {name:<14} skills NDCG@5 {row['skills']['NDCG@5']:.2f} "
+              f"career NDCG@5 {row['career']['NDCG@5']:.2f}")
+        print(f"    skills top 3: {', '.join(row['skills_top3'])}")
+        print(f"    career top 3: {', '.join(row['career_top3'])}")
     print()
 
 
@@ -1062,8 +1600,13 @@ def synthetic_catalog(n: int, seed: int = 7) -> list[JobPosting]:
             for i in range(n)]
 
 
-def benchmark(sizes=(1_000, 10_000, 50_000), queries: int = 30, top: int = 10, seed: int = 7) -> list[dict]:
+def benchmark(sizes=(1_000, 10_000, 50_000), queries: int = 30, top: int = 10, seed: int = 7,
+              ranking: str = "skills") -> list[dict]:
     """Index build time and per-search latency on synthetic catalogs; each search uses new skills."""
+    if queries < 1:
+        raise ValueError(f"queries must be at least 1 (got {queries})")
+    if ranking not in RANKING_MODES:
+        raise ValueError(f"ranking must be one of {RANKING_MODES} (got {ranking!r})")
     rng = random.Random(seed)
     vocab = sorted({s for job in SAMPLE_JOBS for s in job.must_have_skills + job.nice_to_have_skills})
     results = []
@@ -1072,7 +1615,7 @@ def benchmark(sizes=(1_000, 10_000, 50_000), queries: int = 30, top: int = 10, s
         canon.cache_clear()
         alternatives.cache_clear()
         start = time.perf_counter()
-        index = JobIndex(catalog)
+        index = CareerRanker(catalog) if ranking == "career" else JobIndex(catalog)
         build_ms = (time.perf_counter() - start) * 1000
         latencies = []
         for _ in range(queries):
@@ -1081,21 +1624,22 @@ def benchmark(sizes=(1_000, 10_000, 50_000), queries: int = 30, top: int = 10, s
             index.rank(skills, top=top)
             latencies.append((time.perf_counter() - start) * 1000)
         results.append({
-            "jobs": n, "build_ms": build_ms,
+            "ranking": ranking, "jobs": n, "build_ms": build_ms,
             "p50_ms": statistics.median(latencies),
-            "p95_ms": statistics.quantiles(latencies, n=20)[18],
+            # quantiles() needs two samples before Python 3.13
+            "p95_ms": statistics.quantiles(latencies, n=20)[18] if len(latencies) > 1 else latencies[0],
             "jobs_per_sec": n / (statistics.mean(latencies) / 1000),
         })
     return results
 
 
 def print_benchmark(results: list[dict]) -> None:
-    line = "=" * 60
+    line = "=" * 68
     print(f"\n{line}\n⚡ JOB SEARCH BENCHMARK (synthetic catalogs, top 10)\n{line}")
-    print(f"  {'jobs':>8}{'index build':>14}{'search p50':>13}{'search p95':>13}{'jobs/sec':>12}")
+    print(f"  {'ranking':<9}{'jobs':>8}{'index build':>14}{'search p50':>13}{'search p95':>13}{'jobs/sec':>12}")
     for r in results:
-        print(f"  {r['jobs']:>8,}{r['build_ms']:>11.0f} ms{r['p50_ms']:>10.1f} ms{r['p95_ms']:>10.1f} ms"
-              f"{r['jobs_per_sec']:>12,.0f}")
+        print(f"  {r['ranking']:<9}{r['jobs']:>8,}{r['build_ms']:>11.0f} ms{r['p50_ms']:>10.1f} ms"
+              f"{r['p95_ms']:>10.1f} ms{r['jobs_per_sec']:>12,.0f}")
     print(f"\n  For comparison: the LLM Matching Agent on every job would take "
           f"{results[-1]['jobs']:,} API calls for one search.\n")
 
@@ -1234,19 +1778,61 @@ class TestPipelineGuards(unittest.TestCase):
 
 
 class TestAccuracy(unittest.TestCase):
-    def test_ranking_quality_and_beats_exact_name_baseline(self):
-        ranking = evaluate()["ranking"]
-        matcher, baseline = ranking["matcher"], ranking["baseline"]
-        self.assertGreaterEqual(matcher["Top-1"], 0.85)
-        self.assertGreaterEqual(matcher["NDCG@5"], 0.85)
-        self.assertGreaterEqual(matcher["Recall@5"], 0.85)
-        self.assertGreater(matcher["NDCG@5"], baseline["NDCG@5"])
+    @classmethod
+    def setUpClass(cls):
+        cls.report = evaluate()
+
+    def test_evaluation_reports_all_rankers_on_same_labels(self):
+        self.assertEqual(set(self.report["ranking"]), {"skills", "career", "baseline"})
+        for row in self.report["per_candidate"].values():
+            self.assertEqual(len(row["skills_top3"]), 3)
+            self.assertEqual(len(row["career_top3"]), 3)
+            self.assertEqual(len(row["baseline_top3"]), 3)
+
+    def test_both_rankers_meet_the_quality_bar_and_beat_the_exact_name_baseline(self):
+        # Regression gates: measured skills 0.89 / 0.95 / 0.90, career 0.89 / 0.97 / 0.93 (Top-1 / NDCG@5 / Recall@5).
+        ranking = self.report["ranking"]
+        for ranker in ("skills", "career"):
+            with self.subTest(ranker=ranker):
+                metrics = ranking[ranker]
+                self.assertGreaterEqual(metrics["Top-1"], 0.85)
+                self.assertGreaterEqual(metrics["NDCG@5"], 0.85)
+                self.assertGreaterEqual(metrics["Recall@5"], 0.85)
+                self.assertGreater(metrics["NDCG@5"], ranking["baseline"]["NDCG@5"])
+        # Career mode is opt-in; it must not rank worse than the default it is offered as an upgrade to.
+        self.assertGreaterEqual(ranking["career"]["NDCG@5"], ranking["skills"]["NDCG@5"])
+
+    def test_names_outside_the_tables_keep_their_identity(self):
+        self.assertNotEqual(canon("Database design"), canon("Design"))  # 'database' is not filler here
+        self.assertEqual(canon("Experience with SQL databases"), "sql")    # but is here
+        self.assertEqual(SkillMatcher(["A/B testing"]).judge(alternatives("A/B testing"))[0], "met")
+        thai = dedupe_requirements(["Python", "การสื่อสาร"], ["ภาษาอังกฤษ"])
+        self.assertEqual([skill for skill, _ in thai], ["Python", "การสื่อสาร", "ภาษาอังกฤษ"])
+
+    def test_experience_evidence_uses_strongest_source_once(self):
+        profile = ResumeProfile(
+            name="Test", skills=["Python"],
+            projects=[Project(name="P", description="Built with Python", skills_used=["Python"])],
+            experience=["Used Python in production"], education=["Coursework: Python"],
+            activities=["Python club"],
+        )
+        self.assertEqual(applied_skill_evidence(profile)[canon("Python")],
+                         ("work_experience", EVIDENCE_WEIGHTS["work_experience"]))
+
+    def test_skills_section_alone_is_not_applied_evidence(self):
+        self.assertEqual(applied_skill_evidence(ResumeProfile(name="Test", skills=["Python"])), {})
 
 
 class TestPerformance(unittest.TestCase):
     def test_search_10k_jobs_under_budget(self):
         # Budgets are ~8x what a laptop measures (p95 ~30 ms, build ~270 ms), to stay stable on slow machines.
         result = benchmark(sizes=(10_000,), queries=20)[0]
+        self.assertLess(result["p95_ms"], 250, result)
+        self.assertLess(result["build_ms"], 2_000, result)
+
+    def test_career_search_10k_jobs_under_budget(self):
+        # Same budgets: ~2x the measured career search (p95 ~110 ms) and ~4x its build (~520 ms).
+        result = benchmark(sizes=(10_000,), queries=20, ranking="career")[0]
         self.assertLess(result["p95_ms"], 250, result)
         self.assertLess(result["build_ms"], 2_000, result)
 
@@ -1270,7 +1856,7 @@ def run_with_llm_errors(model: str, fn, *args):
         sys.exit("❌ Gemini rejected the API key. Check GOOGLE_API_KEY in .env.")
     except ModelNotFoundError:
         sys.exit(f"❌ Model '{model}' not found. Set GEMINI_MODEL in .env to a current Gemini model.")
-    except InputTooLongError as e:
+    except (InputTooLongError, FileNotFoundError) as e:
         sys.exit(f"❌ {e}")
 
 
@@ -1281,6 +1867,8 @@ def planned_llm_calls(args, items: Optional[list[dict]]) -> int:
 
 
 def run_find_jobs(args) -> None:
+    if args.skills is not None and not any(s.strip() for s in args.skills.split(",")):
+        sys.exit("❌ --skills has no skill names. Give a comma-separated list, e.g. --skills \"Python, SQL\".")
     items = read_job_file(args.jobs) if args.jobs else None
     # Check the budget before any call, so a big catalog can't drain the quota half-way through.
     calls = planned_llm_calls(args, items)
@@ -1299,8 +1887,14 @@ def run_find_jobs(args) -> None:
         print("ℹ️  No --skills or --resume given; using the sample resume's skills.", file=sys.stderr)
         skills = SAMPLE_SKILLS
 
+    # getattr: callers that build their own Namespace (older scripts, tests) need not know these options.
+    try:
+        weights = RankingWeights.parse(args.weights) if getattr(args, "weights", None) else None
+    except ValueError as e:
+        sys.exit(f"❌ {e}")
     timings: dict = {}
-    matches = find_jobs(skills, jobs, top=args.top, rerank=args.rerank, profile=profile, timings=timings)
+    matches = find_jobs(skills, jobs, top=args.top, rerank=args.rerank, profile=profile, timings=timings,
+                        ranking=getattr(args, "ranking", "skills"), weights=weights)
     if args.json:
         print(json.dumps([m.model_dump() for m in matches], indent=2, ensure_ascii=False))
     else:
@@ -1343,6 +1937,12 @@ def main():
                         help="Re-check the top N jobs with the LLM Matching Agent (N LLM calls)")
     search.add_argument("--max-llm-calls", type=int_at_least(0), default=10, metavar="N",
                         help="Refuse a search that would make more than N LLM calls (default: 10)")
+    search.add_argument("--ranking", choices=RANKING_MODES, default="skills",
+                        help="skills: skill coverage only (default). career: also weigh career path, experience "
+                             "and transferable skills")
+    search.add_argument("--weights", metavar="W",
+                        help='Career-ranking weights, e.g. "technical=0.5,domain=0.2" or "40,25,20,15" '
+                             "(technical, domain, experience, transferable; default 40,25,20,15)")
     args = parser.parse_args()
 
     # Emoji and Thai text in the report crash non-UTF-8 consoles (e.g. default Windows code pages).
@@ -1356,7 +1956,7 @@ def main():
         print_eval(evaluate())
         return
     if args.bench:
-        print_benchmark(benchmark())
+        print_benchmark([row for ranking in RANKING_MODES for row in benchmark(ranking=ranking)])
         return
 
     model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
@@ -1364,11 +1964,14 @@ def main():
         run_with_llm_errors(model, run_find_jobs, args)
         return
 
-    state: CareerState = {
-        "resume_text": read_text(args.resume) if args.resume else SAMPLE_RESUME,
-        "job_description": read_text(args.job_desc) if args.job_desc else SAMPLE_JOB_DESCRIPTION,
-        "weeks": args.weeks,
-    }
+    try:
+        state: CareerState = {
+            "resume_text": read_text(args.resume) if args.resume else SAMPLE_RESUME,
+            "job_description": read_text(args.job_desc) if args.job_desc else SAMPLE_JOB_DESCRIPTION,
+            "weeks": args.weeks,
+        }
+    except FileNotFoundError as e:
+        sys.exit(f"❌ {e}")
     print(f"🚀 Analyzing with {model}...", file=sys.stderr)  # stderr keeps --json output parseable
     result = run_with_llm_errors(model, build_graph().invoke, state)
 

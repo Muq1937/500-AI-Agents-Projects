@@ -4,18 +4,20 @@ Extended test suite for agent.py (AI Career & Internship Agent).
 Complements the built-in `python agent.py --self-test` with:
 
   1. Correctness   - canon/alternatives/SkillMatcher/scoring/reconcile_gaps/fit_plan/IO/CLI,
-                     property tests (monotonicity, order-invariance, oracle re-derivation).
+                     property tests (monotonicity, order-invariance, oracle re-derivation),
+                     and the career ranker (--ranking career).
   2. Accuracy      - an independent HELD-OUT set of requirement cases and candidate rankings,
                      written separately from the in-repo labels so the numbers are not
-                     self-graded. Misses are printed, not hidden.
+                     self-graded, for both rankers. Misses are printed, not hidden.
   3. Performance   - scaling, per-search latency, memory, caching, concurrency, hostile input.
-  4. Known issues  - real defects found while testing, pinned as @expectedFailure tests named
-                     test_BUG_*. When one is fixed, unittest reports "unexpected success":
-                     remove the decorator and keep the test as a regression guard.
+  4. Regressions   - defects this suite found and that are now fixed (Thai names, slashes in names,
+                     severity rules, mistyped paths, blank --skills, quadratic parsing). Each test
+                     says what used to go wrong.
 
-No test calls the LLM or needs an API key. If langchain-core / langchain-google-genai /
-langgraph are not installed, tiny stand-ins are generated in a temp dir (real packages win
-when present, so the same file also runs unchanged in your real environment).
+No test calls the LLM or needs an API key. If python-dotenv / langchain-core /
+langchain-google-genai / langgraph are not installed, tiny stand-ins are generated in a temp dir
+(real packages win when present, so the same file also runs unchanged in your real environment).
+pydantic is always required.
 
 Run:   python -m unittest test_agent_extended -v        (or: pytest test_agent_extended.py -v)
 Skip the slow perf tests:  SKIP_PERF=1 python -m unittest test_agent_extended
@@ -52,6 +54,9 @@ sys.path.insert(0, str(HERE))
 STUB_DIR = None
 
 _STUBS = {
+    "dotenv": {
+        "__init__.py": "def load_dotenv(*args, **kwargs):\n    return False\n",
+    },
     "langchain_core": {
         "__init__.py": "",
         "exceptions.py": textwrap.dedent('''
@@ -231,11 +236,9 @@ class TestNormAndCanon(unittest.TestCase):
             with self.subTest(skill=skill):
                 self.assertNotIn(skill, reachable(skill))
 
-    def test_BUG_stripping_filler_can_erase_the_skill_itself(self):
-        # "database" is filler, so "Database design" collapses to "design" and collides with "Design".
+    def test_filler_is_not_stripped_from_the_skill_itself(self):
+        # Was: "database" was filler anywhere, so "Database design" collapsed to "design".
         self.assertNotEqual(A.canon("Database design"), A.canon("Design"))
-    test_BUG_stripping_filler_can_erase_the_skill_itself = unittest.expectedFailure(
-        test_BUG_stripping_filler_can_erase_the_skill_itself)
 
 
 class TestAlternatives(unittest.TestCase):
@@ -266,13 +269,11 @@ class TestAlternatives(unittest.TestCase):
             with self.subTest(skill=skill):
                 self.assertEqual(status_of([skill], skill), "met")
 
-    def test_BUG_requirement_with_slash_can_never_be_met_by_the_same_name(self):
-        # "A/B testing" is split into ("a", "btesting"), so a candidate who lists "A/B testing" misses it.
+    def test_requirement_with_slash_is_met_by_the_same_name(self):
+        # Was: "A/B testing" was split into ("a", "btesting"), so a candidate who listed it missed it.
         for name in ("A/B testing", "Pub/Sub", "Client/Server"):
             with self.subTest(name=name):
                 self.assertEqual(status_of([name], name), "met")
-    test_BUG_requirement_with_slash_can_never_be_met_by_the_same_name = unittest.expectedFailure(
-        test_BUG_requirement_with_slash_can_never_be_met_by_the_same_name)
 
 
 class TestSkillMatcher(unittest.TestCase):
@@ -375,12 +376,10 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(out, [("Python", "must-have"), ("Postgres", "must-have"), ("Docker", "nice-to-have")])
         self.assertEqual(A.dedupe_requirements([], []), [])
 
-    def test_BUG_requirements_without_latin_letters_are_silently_dropped(self):
-        # canon("ภาษาไทย") == "" so the requirement vanishes from the score and from the LLM prompt.
+    def test_requirements_without_latin_letters_are_kept(self):
+        # Was: canon("ภาษาไทย") == "", so the requirement vanished from the score and the LLM prompt.
         out = A.dedupe_requirements(["Python", "การสื่อสาร"], ["ภาษาอังกฤษ"])
         self.assertEqual(len(out), 3)
-    test_BUG_requirements_without_latin_letters_are_silently_dropped = unittest.expectedFailure(
-        test_BUG_requirements_without_latin_letters_are_silently_dropped)
 
 
 class TestMatchSkillsNode(unittest.TestCase):
@@ -425,9 +424,9 @@ class TestMatchSkillsNode(unittest.TestCase):
         match, _ = self.run_node(A.JobRequirements(title="T"), A.MatchAssessment(assessments=[], summary=""))
         self.assertEqual((match.score, match.assessments, match.eligibility), (0, [], []))
 
-    def test_BUG_thai_eligibility_criteria_collide(self):
-        # norm() strips Thai letters, so every Thai criterion maps to the key "" and they all
-        # receive the LAST criterion's verdict.
+    def test_thai_eligibility_criteria_stay_separate(self):
+        # Was: norm() stripped Thai letters, so every Thai criterion mapped to the key "" and they all
+        # received the LAST criterion's verdict.
         jd = A.JobRequirements(title="T", eligibility=["กำลังศึกษาปริญญาตรี", "พร้อมเริ่มงานฤดูร้อน"])
         reply = A.MatchAssessment(summary="", assessments=[], eligibility=[
             A.EligibilityCheck(criterion="กำลังศึกษาปริญญาตรี", status="met", evidence="Year 3"),
@@ -435,7 +434,6 @@ class TestMatchSkillsNode(unittest.TestCase):
         ])
         match, _ = self.run_node(jd, reply)
         self.assertEqual([c.status for c in match.eligibility], ["met", "not-met"])
-    test_BUG_thai_eligibility_criteria_collide = unittest.expectedFailure(test_BUG_thai_eligibility_criteria_collide)
 
 
 class TestReconcileGaps(unittest.TestCase):
@@ -475,26 +473,20 @@ class TestReconcileGaps(unittest.TestCase):
         self.assertEqual(out.gaps, [])
         self.assertTrue(out.strengths)
 
-    def test_BUG_llm_can_mark_a_nice_to_have_as_blocking(self):
-        # GAP_PROMPT defines blocking as "a must-have that is missing", but the code only
-        # ever upgrades severity; it never downgrades an invalid "blocking".
+    def test_llm_cannot_mark_a_nice_to_have_as_blocking(self):
+        # GAP_PROMPT defines blocking as "a must-have that is missing"; the code used to only
+        # upgrade severity, never downgrade an invalid "blocking".
         gaps = A.reconcile_gaps([RA("Docker", "nice-to-have", "missing")], [self.gap("Docker", "blocking")], [])
         self.assertNotEqual(gaps[0].severity, "blocking")
-    test_BUG_llm_can_mark_a_nice_to_have_as_blocking = unittest.expectedFailure(
-        test_BUG_llm_can_mark_a_nice_to_have_as_blocking)
 
-    def test_BUG_partial_must_have_can_be_downgraded_below_important(self):
+    def test_partial_must_have_is_never_below_important(self):
         gaps = A.reconcile_gaps([RA("SQL", "must-have", "partial")], [self.gap("SQL", "nice-to-have")], [])
         self.assertIn(gaps[0].severity, ("important", "blocking"))
-    test_BUG_partial_must_have_can_be_downgraded_below_important = unittest.expectedFailure(
-        test_BUG_partial_must_have_can_be_downgraded_below_important)
 
-    def test_BUG_two_thai_eligibility_failures_collapse_into_one_gap(self):
+    def test_two_thai_eligibility_failures_are_two_gaps(self):
         checks = [A.EligibilityCheck(criterion="กำลังศึกษาปริญญาตรี", status="not-met", evidence=""),
                   A.EligibilityCheck(criterion="พร้อมเริ่มงานฤดูร้อน", status="not-met", evidence="")]
         self.assertEqual(len(A.reconcile_gaps([], [], checks)), 2)
-    test_BUG_two_thai_eligibility_failures_collapse_into_one_gap = unittest.expectedFailure(
-        test_BUG_two_thai_eligibility_failures_collapse_into_one_gap)
 
 
 class TestFitPlan(unittest.TestCase):
@@ -652,6 +644,112 @@ class TestFindJobs(unittest.TestCase):
         self.assertNotIn("reranked", t)
 
 
+class TestCareerRanker(unittest.TestCase):
+    """--ranking career: the score is a weighted sum of four components the breakdown reports."""
+
+    SKILLS = ["Python", "PostgreSQL", "Docker", "FastAPI", "Git"]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ranker = A.CareerRanker(A.SAMPLE_JOBS)
+        cls.full = cls.ranker.rank(cls.SKILLS, top=None)
+
+    def test_default_ranking_is_still_skills_only(self):
+        default = A.find_jobs(self.SKILLS, A.SAMPLE_JOBS, top=5)
+        skills = A.JobIndex(A.SAMPLE_JOBS).rank(self.SKILLS, top=5)
+        self.assertEqual([(m.job.id, m.score) for m in default], [(m.job.id, m.score) for m in skills])
+        self.assertFalse(any(isinstance(m, A.CareerMatch) for m in default))
+
+    def test_breakdown_is_bounded_and_adds_up_to_the_score(self):
+        w = A.DEFAULT_RANKING_WEIGHTS.normalized()
+        for m in self.full:
+            with self.subTest(job=m.job.id):
+                b = m.career
+                for part in (b.technical, b.domain, b.experience, b.transferable):
+                    self.assertTrue(0 <= part <= 1, b)
+                weighted = w.technical * b.technical + w.domain * b.domain + w.experience * b.experience \
+                    + w.transferable * b.transferable
+                self.assertAlmostEqual(weighted, b.total, delta=0.002)  # components are rounded to 3 places
+                self.assertEqual(m.score, round(100 * b.total))
+
+    def test_skill_score_matches_the_skills_ranker(self):
+        skill_scores = {m.job.id: m.score for m in A.JobIndex(A.SAMPLE_JOBS).rank(self.SKILLS, top=None)}
+        for m in self.full:
+            self.assertEqual(m.career.skill_score, skill_scores[m.job.id], m.job.id)
+
+    def test_full_ranking_is_sorted_complete_and_top_k_is_its_prefix(self):
+        self.assertEqual(len(self.full), len(A.SAMPLE_JOBS))
+        self.assertEqual(sorted({m.job.id for m in self.full}), sorted(j.id for j in A.SAMPLE_JOBS))
+        totals = [m.career.total for m in self.full]
+        self.assertEqual(totals, sorted(totals, reverse=True))
+        for k in (1, 3, 7):
+            self.assertEqual([m.job.id for m in self.ranker.rank(self.SKILLS, top=k)],
+                             [m.job.id for m in self.full[:k]])
+
+    def test_skill_order_and_case_do_not_change_the_ranking(self):
+        shuffled = [s.upper() for s in reversed(self.SKILLS)]
+        self.assertEqual([(m.job.id, m.score) for m in self.ranker.rank(shuffled, top=None)],
+                         [(m.job.id, m.score) for m in self.full])
+
+    def test_single_component_weights_rank_by_that_component(self):
+        for name in ("technical", "domain", "experience", "transferable"):
+            with self.subTest(weight=name):
+                ranker = A.CareerRanker(A.SAMPLE_JOBS, A.RankingWeights.parse(
+                    ",".join(f"{n}={1 if n == name else 0}" for n in A.RankingWeights.model_fields)))
+                for m in ranker.rank(self.SKILLS, top=None):
+                    self.assertAlmostEqual(m.career.total, getattr(m.career, name), delta=0.001)
+
+    def test_adding_a_project_never_lowers_experience_and_leaves_technical_fit_alone(self):
+        # Was: a profile with no applied evidence fell back to skill depth, which could be higher than the
+        # blend used once any evidence existed, so adding a project to a resume LOWERED experience
+        # (backend-fintech: 0.851 -> 0.778).
+        bare = A.ResumeProfile(name="Ploy", skills=self.SKILLS)
+        with_project = bare.model_copy(update={"projects": [
+            A.Project(name="Wallet API", description="Built a REST API with FastAPI and PostgreSQL in Docker",
+                      skills_used=["FastAPI", "PostgreSQL", "Docker"])]})
+        before = {m.job.id: m.career for m in self.ranker.rank(self.SKILLS, top=None, profile=bare)}
+        after = {m.job.id: m.career for m in self.ranker.rank(self.SKILLS, top=None, profile=with_project)}
+        for job_id, career in after.items():
+            with self.subTest(job=job_id):
+                self.assertEqual(career.technical, before[job_id].technical)
+                self.assertGreaterEqual(career.experience, before[job_id].experience)
+        self.assertGreater(after["backend-fintech"].experience, before["backend-fintech"].experience)
+
+    def test_odd_inputs_do_not_crash(self):
+        for skills in ([], ["ภาษาไทย"], ["🚀"], ["x" * 10_000]):
+            with self.subTest(skills=skills[:1]):
+                out = self.ranker.rank(skills, top=3)
+                self.assertEqual(len(out), 3)
+                self.assertTrue(all(0 <= m.score <= 100 for m in out))
+        self.assertEqual(A.CareerRanker([]).rank(self.SKILLS, top=5), [])
+
+    def test_weights_parse(self):
+        defaults = A.DEFAULT_RANKING_WEIGHTS.normalized()
+        self.assertEqual(A.RankingWeights.parse("40,25,20,15").normalized(), defaults)
+        self.assertEqual(A.RankingWeights.parse(" 0.4 , 0.25,0.2,0.15 ").normalized(), defaults)
+        self.assertEqual(A.RankingWeights.parse("technical=1").domain, A.DEFAULT_RANKING_WEIGHTS.domain)
+        for bad in ("1,2,3", "1,2,3,4,5", "speed=1", "0,0,0,0", "-1,1,1,1", "nan,1,1,1", "inf,1,1,1",
+                    "technical=x", ""):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                A.RankingWeights.parse(bad)
+
+    def test_find_jobs_validates_ranking(self):
+        with self.assertRaises(ValueError):
+            A.find_jobs(self.SKILLS, A.SAMPLE_JOBS, ranking="vibes")
+        career = A.find_jobs(self.SKILLS, A.SAMPLE_JOBS, top=3, ranking="career")
+        self.assertEqual([m.job.id for m in career], [m.job.id for m in self.full[:3]])
+
+    def test_cli_career_ranking_and_bad_weights(self):
+        r = cli("--find-jobs", "--skills", "Python, SQL", "--ranking", "career", "--top", "2", "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual(len(data), 2)
+        self.assertIn("career", data[0])
+        bad = cli("--find-jobs", "--skills", "Python", "--ranking", "career", "--weights", "1,2")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("bad weights", bad.stderr)
+
+
 class TestInputsAndIO(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="agent_io_"))
@@ -687,12 +785,10 @@ class TestInputsAndIO(unittest.TestCase):
         out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
         return out
 
-    def test_BUG_mistyped_resume_path_is_sent_to_the_llm_as_text(self):
-        # A typo such as "resumee.pdf" is silently analyzed as the literal text "resumee.pdf".
+    def test_mistyped_resume_path_is_reported(self):
+        # Was: a typo such as "resumee.pdf" was silently analyzed as the literal text "resumee.pdf".
         with self.assertRaises((FileNotFoundError, ValueError)):
             A.read_text(str(self.tmp / "resumee.pdf"))
-    test_BUG_mistyped_resume_path_is_sent_to_the_llm_as_text = unittest.expectedFailure(
-        test_BUG_mistyped_resume_path_is_sent_to_the_llm_as_text)
 
     def test_ask_length_guard_boundary(self):
         fake_llm = mock.Mock()
@@ -791,12 +887,10 @@ class TestPlannedCallsAndFindJobsRunner(unittest.TestCase):
         self.assertIn("Top 3 of 14 jobs", out)
         self.assertIn("Ranked 14 jobs in", out)
 
-    def test_BUG_search_with_only_blank_skills_is_not_refused(self):
-        # "--skills ','" yields [] and prints a meaningless ranking of 0/100 jobs.
+    def test_search_with_only_blank_skills_is_refused(self):
+        # Was: "--skills ','" yielded [] and printed a meaningless ranking of 0/100 jobs.
         with self.assertRaises(SystemExit):
             self.run_find(skills=" , ")
-    test_BUG_search_with_only_blank_skills_is_not_refused = unittest.expectedFailure(
-        test_BUG_search_with_only_blank_skills_is_not_refused)
 
 
 class TestLlmErrorMapping(unittest.TestCase):
@@ -946,7 +1040,8 @@ class TestCli(unittest.TestCase):
             self.skipTest("SKIP_PERF=1")
         r = cli("--self-test", timeout=300)
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])
-        self.assertIn("Ran 17 tests", r.stderr)
+        expected = unittest.defaultTestLoader.loadTestsFromModule(A).countTestCases()
+        self.assertIn(f"Ran {expected} tests", r.stderr)
 
 
 class TestBenchmarkHelpers(unittest.TestCase):
@@ -968,14 +1063,16 @@ class TestBenchmarkHelpers(unittest.TestCase):
         self.assertAlmostEqual(ratio, 0.15 + 0.85 * base, delta=0.02)
 
     def test_benchmark_result_shape(self):
-        r = A.benchmark(sizes=(200,), queries=5)[0]
-        self.assertEqual(set(r), {"jobs", "build_ms", "p50_ms", "p95_ms", "jobs_per_sec"})
-        self.assertGreater(r["jobs_per_sec"], 0)
-        self.assertLessEqual(r["p50_ms"], r["p95_ms"] + 1e-9)
+        for ranking in A.RANKING_MODES:
+            with self.subTest(ranking=ranking):
+                r = A.benchmark(sizes=(200,), queries=5, ranking=ranking)[0]
+                self.assertEqual(set(r), {"ranking", "jobs", "build_ms", "p50_ms", "p95_ms", "jobs_per_sec"})
+                self.assertEqual(r["ranking"], ranking)
+                self.assertGreater(r["jobs_per_sec"], 0)
+                self.assertLessEqual(r["p50_ms"], r["p95_ms"] + 1e-9)
 
-    # statistics.quantiles() raised StatisticsError for a single sample until Python 3.13, so on older
-    # interpreters (the README benchmarks on 3.10) benchmark(queries=1) is a real crash.
-    @unittest.expectedFailure if sys.version_info < (3, 13) else (lambda f: f)
+    # statistics.quantiles() raises StatisticsError for a single sample before Python 3.13, which used to
+    # crash benchmark(queries=1) on older interpreters (the README benchmarks on 3.10).
     def test_benchmark_with_a_single_query(self):
         A.benchmark(sizes=(50,), queries=1)
 
@@ -1089,31 +1186,41 @@ class TestHeldOutAccuracy(unittest.TestCase):
         false_met_partial = [(s, r) for s, r, e in HELD_OUT_REQUIREMENTS if e == "partial" and status_of(s, r) == "met"]
         self.assertEqual(false_met_partial, [])
 
+    RANKERS = {"skills": A.JobIndex, "career": A.CareerRanker}
+
     def test_ranking_quality_on_held_out_candidates(self):
-        index = A.JobIndex(A.SAMPLE_JOBS)
-        rows_m, rows_b, detail = [], [], []
-        for name, (skills, labels) in HELD_OUT_CANDIDATES.items():
-            ranked = [m.job.id for m in index.rank(skills, top=None)]
-            rows_m.append(A.ranking_metrics(ranked, labels))
-            rows_b.append(A.ranking_metrics(A.baseline_rank(A.SAMPLE_JOBS, skills), labels))
-            detail.append((name, ranked[:3], labels))
         mean = lambda rows, k: statistics.mean(r[k] for r in rows)  # noqa: E731
-        for metric in rows_m[0]:
-            PERF_REPORT.append((f"held-out ranking {metric}", f"matcher {mean(rows_m, metric):.2f} / baseline {mean(rows_b, metric):.2f}"))
-        for name, top3, labels in detail:
-            PERF_REPORT.append((f"  {name} top-3", ", ".join(top3)))
-        self.assertGreaterEqual(mean(rows_m, "Top-1"), 0.80)
-        self.assertGreaterEqual(mean(rows_m, "NDCG@5"), 0.85)
-        self.assertGreaterEqual(mean(rows_m, "Recall@5"), 0.85)
-        self.assertGreaterEqual(mean(rows_m, "NDCG@5"), mean(rows_b, "NDCG@5"))
+        rows_b = [A.ranking_metrics(A.baseline_rank(A.SAMPLE_JOBS, skills), labels)
+                  for skills, labels in HELD_OUT_CANDIDATES.values()]
+        rows = {}
+        for ranker, cls in self.RANKERS.items():
+            index = cls(A.SAMPLE_JOBS)
+            rows[ranker] = []
+            for name, (skills, labels) in HELD_OUT_CANDIDATES.items():
+                ranked = [m.job.id for m in index.rank(skills, top=None)]
+                rows[ranker].append(A.ranking_metrics(ranked, labels))
+                PERF_REPORT.append((f"  {ranker} {name} top-3", ", ".join(ranked[:3])))
+        for metric in rows_b[0]:
+            PERF_REPORT.append((f"held-out ranking {metric}", f"skills {mean(rows['skills'], metric):.2f} / "
+                                f"career {mean(rows['career'], metric):.2f} / baseline {mean(rows_b, metric):.2f}"))
+        # The exact-name baseline already scores Top-1 1.00 here, so these labels are easy: they catch
+        # regressions, they do not show which ranker is better.
+        for ranker, ranker_rows in rows.items():
+            with self.subTest(ranker=ranker):
+                self.assertGreaterEqual(mean(ranker_rows, "Top-1"), 0.80)
+                self.assertGreaterEqual(mean(ranker_rows, "NDCG@5"), 0.85)
+                self.assertGreaterEqual(mean(ranker_rows, "Recall@5"), 0.85)
+                self.assertGreaterEqual(mean(ranker_rows, "NDCG@5"), mean(rows_b, "NDCG@5"))
 
     def test_strong_fit_is_never_ranked_below_a_poor_fit(self):
-        index = A.JobIndex(A.SAMPLE_JOBS)
-        for name, (skills, labels) in HELD_OUT_CANDIDATES.items():
-            order = [m.job.id for m in index.rank(skills, top=None)]
-            for strong in (j for j, g in labels.items() if g == 2):
-                worse_than = [j for j in order[:order.index(strong)] if labels.get(j, 0) == 0]
-                self.assertLessEqual(len(worse_than), 2, f"{name}: {strong} sits below poor fits {worse_than}")
+        for ranker, cls in self.RANKERS.items():
+            index = cls(A.SAMPLE_JOBS)
+            for name, (skills, labels) in HELD_OUT_CANDIDATES.items():
+                order = [m.job.id for m in index.rank(skills, top=None)]
+                for strong in (j for j, g in labels.items() if g == 2):
+                    worse_than = [j for j in order[:order.index(strong)] if labels.get(j, 0) == 0]
+                    self.assertLessEqual(len(worse_than), 2,
+                                         f"{ranker}/{name}: {strong} sits below poor fits {worse_than}")
 
 
 class TestRankingMetrics(unittest.TestCase):
@@ -1162,10 +1269,12 @@ class TestDocumentationClaims(unittest.TestCase):
         self.assertEqual(r["requirement_cases"], 43)
         self.assertAlmostEqual(r["requirement_accuracy"], 0.930, places=3)
         self.assertAlmostEqual(r["baseline_requirement_accuracy"], 0.163, places=3)
-        matcher, baseline = r["ranking"]["matcher"], r["ranking"]["baseline"]
-        for metric, m_expected, b_expected in (("Top-1", .89, .78), ("MRR", .91, .87), ("NDCG@5", .95, .91), ("Recall@5", .90, .84)):
+        skills, career, baseline = (r["ranking"][k] for k in ("skills", "career", "baseline"))
+        for metric, s_expected, c_expected, b_expected in (("Top-1", .89, .89, .78), ("MRR", .91, .92, .87),
+                                                           ("NDCG@5", .95, .97, .91), ("Recall@5", .90, .93, .84)):
             with self.subTest(metric=metric):
-                self.assertAlmostEqual(matcher[metric], m_expected, places=2)
+                self.assertAlmostEqual(skills[metric], s_expected, places=2)
+                self.assertAlmostEqual(career[metric], c_expected, places=2)
                 self.assertAlmostEqual(baseline[metric], b_expected, places=2)
 
     def test_readme_says_the_three_misses_are_spring_boot_mongodb_and_react_native(self):
@@ -1245,6 +1354,20 @@ class TestPerformance(unittest.TestCase):
         self.assertLess(p50, 150)
         self.assertLess(best_of(lambda: A.JobIndex(catalog)), 2_000)
 
+    def test_career_ranker_scales_linearly_and_meets_budgets(self):
+        small_cat, big_cat = A.synthetic_catalog(5_000), A.synthetic_catalog(20_000)
+        build_small = best_of(lambda: A.CareerRanker(small_cat), 2)
+        build_big = best_of(lambda: A.CareerRanker(big_cat), 2)
+        search_small = median_search_ms(A.CareerRanker(small_cat), VOCAB)
+        search_big = median_search_ms(A.CareerRanker(big_cat), VOCAB)
+        p50_10k = median_search_ms(A.CareerRanker(A.synthetic_catalog(10_000)), VOCAB, queries=20)
+        PERF_REPORT.append(("career build 5,000 / 20,000 jobs", f"{build_small:.0f} ms / {build_big:.0f} ms"))
+        PERF_REPORT.append(("career search p50 5,000 / 20,000 jobs", f"{search_small:.1f} ms / {search_big:.1f} ms"))
+        PERF_REPORT.append(("career search p50, 10k jobs, top 10", f"{p50_10k:.1f} ms"))
+        self.assertLess(build_big / build_small, 8, "career build is worse than ~linear")
+        self.assertLess(search_big / search_small, 8, "career search is worse than ~linear")
+        self.assertLess(p50_10k, 250)
+
     def test_default_builtin_search_is_effectively_instant(self):
         ms = best_of(lambda: A.find_jobs(A.SAMPLE_SKILLS, A.SAMPLE_JOBS, top=5), repeats=5)
         PERF_REPORT.append(("built-in 14-job search incl. index build", f"{ms:.2f} ms"))
@@ -1313,10 +1436,9 @@ class TestPerformance(unittest.TestCase):
             PERF_REPORT.append((f"alternatives() on {label} ({len(text):,} chars)", f"{ms:.0f} ms"))
             self.assertLess(ms, 2_000, label)
 
-    @unittest.expectedFailure
-    def test_BUG_alternatives_is_quadratic_on_unbalanced_parentheses(self):
-        # The regex r"(.*?)\((.+)\)\s*" backtracks: 4x the input costs ~16x the time (measured 68 ms at
-        # 5k chars, 1.1 s at 20k, 4.3 s at 40k). Requirement strings come from user-supplied --jobs files.
+    def test_alternatives_is_linear_on_unbalanced_parentheses(self):
+        # The old regex r"(.*?)\((.+)\)\s*" backtracked: 4x the input cost ~16x the time (68 ms at 5k chars,
+        # 1.1 s at 20k, 4.3 s at 40k). Requirement strings come from user-supplied --jobs files.
         def cost(n):
             def once():
                 A.alternatives.cache_clear()

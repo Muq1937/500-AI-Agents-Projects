@@ -32,7 +32,8 @@ back to the per-requirement assessments:
 | nice-to-have (weight 1) | 1 | 0.5 | 0 |
 
 `score = 100 × earned / maximum`. The code also guarantees that every JD requirement
-is assessed exactly once, and that a missing must-have is always ranked **blocking**.
+is assessed exactly once, and enforces the severity rules: a missing must-have is always
+**blocking**, a partial must-have always **important**, and a nice-to-have is never blocking.
 The gap list is reconciled with the assessments: every unmet requirement appears once,
 and gaps the LLM invents are dropped.
 
@@ -76,7 +77,8 @@ python agent.py --resume path/to/resume.pdf --job-desc path/to/job_posting.txt
 python agent.py --weeks 4 --json
 ```
 
-`--resume` and `--job-desc` accept a `.pdf` or text file, or raw text.
+`--resume` and `--job-desc` accept a `.pdf` or text file, or raw text. A file name that doesn't
+exist (`resumee.pdf`) is reported as an error instead of being analyzed as text.
 Runtime: five LLM calls, typically under a minute.
 
 ## Find jobs that match your skills
@@ -92,6 +94,10 @@ python agent.py --find-jobs --resume resume.pdf --jobs jobs.json --top 10
 
 # Re-check the top 3 with the LLM Matching Agent (3 more LLM calls, run in parallel)
 python agent.py --find-jobs --resume resume.pdf --rerank 3
+
+# Rank by career fit, not just skill coverage (still no LLM call)
+python agent.py --find-jobs --skills "Python, PostgreSQL, Docker" --ranking career
+python agent.py --find-jobs --resume resume.pdf --ranking career --weights "technical=0.5,domain=0.3"
 ```
 
 Without `--jobs`, it searches a built-in catalog of 14 fictional internships in Thailand
@@ -115,7 +121,10 @@ the main score. It knows these relationships between skills:
 | | Example | Result |
 |---|---|---|
 | Aliases | `Postgres` for *PostgreSQL*, `ReactJS` for *React* | met |
+| Versions | `Python 3.11` for *Python*, `Java 17` for *Java* | met |
 | Implications | `PostgreSQL` for *SQL*, `Next.js` for *JavaScript*, `scikit-learn` for *Machine Learning* | met |
+| Specializations | `Docker Compose` for *Docker*, `Spring Boot` for *Spring* | met |
+| | `Docker` for *Docker Compose* (the broader skill only) | partial |
 | Families | `MySQL` for *PostgreSQL*, `Flask` for *FastAPI or Django* | partial |
 | Compounds | `HTML` alone for *HTML/CSS* | partial |
 | Umbrella terms | `Azure` or general cloud for *Cloud (AWS/GCP)* | partial |
@@ -123,8 +132,22 @@ the main score. It knows these relationships between skills:
 Requirements with alternatives (`FastAPI or Django`, `Cloud (AWS/GCP)`) are met by any one of them,
 and the same skill listed twice under different names (`Postgres`, `PostgreSQL`) counts once.
 Ties are broken by the number of missing must-haves. A skill that isn't in the matcher's tables
-(for example `Spring Boot`) only matches its exact name. That is what `--rerank` is for: the
-LLM judges the top results from your full resume, including how deep each skill goes.
+(for example `Terraform`) only matches its own name, in any script (Thai names work too). That is
+what `--rerank` is for: the LLM judges the top results from your full resume, including how deep
+each skill goes.
+
+**Career ranking** (`--ranking career`, opt-in) scores four parts and reports each one:
+
+| Part | Default weight | What it measures |
+|---|---|---|
+| technical | 40% | skill coverage, with specific tools (`FastAPI`) counting more than generic ones (`Git`) |
+| domain | 25% | how well your skills' career path (backend, data, mobile, ...) fits the job's |
+| experience | 20% | depth in the job's path; with `--resume`, skills shown in work, projects and coursework |
+| transferable | 15% | coverage of the generic requirements |
+
+`--weights` changes the split, either by name (`technical=0.5,domain=0.3`, the rest keep their
+defaults) or as four numbers (`40,25,20,15`). The weights and the skill-to-path tables were set by
+hand, not tuned on data.
 
 **LLM call budget.** A search is refused before it starts if it would make more than
 `--max-llm-calls` calls (default 10), counting the resume, each description-only posting and
@@ -144,19 +167,25 @@ None of these call the LLM, so they run without an API key.
 ```bash
 python agent.py --eval        # accuracy against hand-labeled cases
 python agent.py --bench       # search speed on synthetic catalogs of 1k / 10k / 50k jobs
-python agent.py --self-test   # 17 unit, accuracy and performance tests (also: python -m unittest agent)
+python agent.py --self-test   # 22 unit, accuracy and performance tests (also: python -m unittest agent)
+python -m unittest test_agent_extended   # 137 more, incl. a held-out label set (SKIP_PERF=1 skips the slow ones)
 ```
 
 **Accuracy** (`--eval`) is measured at two levels and compared with an exact-name baseline
 that uses the same weights but no aliases, implications or families:
 
-| Level | Metric | Matcher | Exact-name baseline |
-|---|---|---|---|
-| Requirement (43 cases) | status accuracy (met/partial/missing) | 93.0% | 16.3% |
-| Ranking (9 candidates × 14 jobs) | Top-1 (best result is a strong fit) | 0.89 | 0.78 |
-| | MRR (first strong fit) | 0.91 | 0.87 |
-| | NDCG@5 | 0.95 | 0.91 |
-| | Recall@5 (any fit) | 0.90 | 0.84 |
+| Level | Metric | Skills ranking | Career ranking | Exact-name baseline |
+|---|---|---|---|---|
+| Requirement (43 cases) | status accuracy (met/partial/missing) | 93.0% | | 16.3% |
+| Ranking (9 candidates × 14 jobs) | Top-1 (best result is a strong fit) | 0.89 | 0.89 | 0.78 |
+| | MRR (first strong fit) | 0.91 | 0.92 | 0.87 |
+| | NDCG@5 | 0.95 | 0.97 | 0.91 |
+| | Recall@5 (any fit) | 0.90 | 0.93 | 0.84 |
+
+`test_agent_extended.py` also checks a held-out set written separately from these labels
+(69 requirement cases, 9 candidates). There, NDCG@5 is 0.96 for skills ranking and 0.98 for career
+ranking. The exact-name baseline already gets Top-1 1.00 on that set, so it is easy: it catches
+regressions but can't tell the two rankers apart.
 
 The three requirement misses are out-of-vocabulary on purpose (`Spring Boot` → Java,
 `MongoDB` → NoSQL, `React` → React Native). The ranking miss is the sample-resume candidate:
@@ -170,16 +199,20 @@ in `agent.py`.
 
 **Performance** (`--bench`, one laptop, Python 3.10):
 
-| Jobs | Index build | Search p50 | Search p95 |
-|---|---|---|---|
-| 1,000 | 11 ms | 3.4 ms | 5.2 ms |
-| 10,000 | 118 ms | 24.3 ms | 31.8 ms |
-| 50,000 | 404 ms | 95 ms | 110 ms |
+| Ranking | Jobs | Index build | Search p50 | Search p95 |
+|---|---|---|---|---|
+| skills | 1,000 | 15 ms | 4.5 ms | 6.9 ms |
+| | 10,000 | 145 ms | 30 ms | 34 ms |
+| | 50,000 | 438 ms | 111 ms | 134 ms |
+| career | 1,000 | 48 ms | 9.1 ms | 10.8 ms |
+| | 10,000 | 518 ms | 82 ms | 111 ms |
+| | 50,000 | 2.4 s | 362 ms | 459 ms |
 
-Search time grows linearly with the catalog, at about 400k jobs/second. Requirements are
-parsed once when the index is built, each skill verdict is cached per search, and the detailed
-per-requirement output is built only for the jobs returned. `--self-test` fails if a
-10k-job search takes over 250 ms at p95 or the index build takes over 2 s.
+Search time grows linearly with the catalog: about 400k jobs/second for skills ranking and
+130k for career ranking. Requirements are parsed once when the index is built, in linear time
+even on hostile input, each skill verdict is cached per search, and the detailed per-requirement
+output is built only for the jobs returned. `--self-test` fails if a 10k-job search takes over
+250 ms at p95 or the index build takes over 2 s, for either ranking.
 
 ## Sample Output
 
