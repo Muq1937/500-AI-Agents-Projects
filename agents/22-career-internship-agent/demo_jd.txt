@@ -1,0 +1,24 @@
+Backend Engineer Intern — PayWave (fictional FinTech startup), Bangkok
+Duration: 3 months, summer 2027
+
+Responsibilities
+- Build and maintain REST APIs for our payment and wallet services
+- Write unit and integration tests for new features
+- Take part in code reviews and help with deployments
+- Investigate and fix bugs in production with the team
+
+Requirements
+- Currently pursuing a degree in Computer Science or Computer Engineering
+- Available full-time for 3 months in summer 2027
+- Strong Python skills
+- Experience with SQL databases (PostgreSQL preferred)
+- Understanding of REST API design
+- Experience with automated testing (pytest or similar)
+- Git and collaborative development
+
+Nice to have
+- FastAPI or Django
+- Docker
+- Cloud experience (AWS or GCP)
+- CI/CD pipelines
+- Interest in finance or payments

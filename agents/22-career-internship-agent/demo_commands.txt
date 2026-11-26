@@ -1,0 +1,38 @@
+DEMO COMMANDS — AI Career & Internship Agent
+Copy and paste in this order. Run from the project folder with the venv active.
+
+=== BEFORE THE DEMO (no LLM needed) ===
+python agent.py --self-test
+python agent.py --find-jobs --skills "Python, SQL"
+
+=== BEFORE THE DEMO (uses 5 LLM calls; run ONCE to confirm the key works) ===
+python agent.py --resume demo_resume.txt --job-desc demo_jd.txt
+
+=== SAVE BACKUPS (Plan B if the network or quota fails) ===
+python agent.py --resume demo_resume.txt --job-desc demo_jd.txt > backup_report.txt
+python agent.py --resume demo_resume.txt --job-desc demo_jd.txt --json > backup_output.json
+
+=== LIVE DEMO, step by step ===
+
+# Step 1: job search, no LLM (fast, safe)
+python agent.py --find-jobs --skills "Python, PostgreSQL, Docker, FastAPI, Git"
+
+# Step 2: career-aware ranking (compare with step 1)
+python agent.py --find-jobs --skills "Python, PostgreSQL, Docker, FastAPI, Git" --ranking career
+
+# Step 3: the main pipeline, 5 LLM calls, about 1 minute
+python agent.py --resume demo_resume.txt --job-desc demo_jd.txt --weeks 3
+# While it runs, explain: resume and JD analyzers run in parallel; the score is computed in code;
+# a missing must-have is always "blocking".
+
+# Step 4: proof of quality, no LLM
+python agent.py --eval
+python agent.py --bench
+
+# Optional, only if quota allows (3 more LLM calls): LLM re-check of the top 3
+python agent.py --find-jobs --resume demo_resume.txt --rerank 3
+
+=== EMERGENCY ===
+# Quota or network failure: open backup_report.txt, or run the no-LLM commands above.
+# "model not found": set GEMINI_MODEL in .env to a current Gemini model.
+# Garbled emoji or Thai on Windows: use Windows Terminal, or run: chcp 65001

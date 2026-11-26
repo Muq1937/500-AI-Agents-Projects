@@ -1,0 +1,17 @@
+Nattaporn Chaiyasit (fictional demo candidate)
+B.Eng. Computer Engineering (Year 3), Chulalongkorn University — GPA 3.38
+Expected graduation: 2028
+
+Skills: Python, Java, SQL, MySQL, Git, GitHub, HTML/CSS, Flask, pandas, Linux basics
+
+Projects
+- Library Booking API: Flask + MySQL REST API for booking study rooms, with 6 endpoints
+  and basic login (team of 2). Used Git and GitHub for pull requests and code review.
+- Thai Review Sentiment: Python + scikit-learn model classifying product reviews as positive or
+  negative, 81% accuracy on 2,000 labeled reviews.
+- Database coursework: designed a normalized schema for a hospital system and wrote SQL queries
+  with joins and indexes.
+
+Activities
+- Member, Chula Computer Engineering Programming Club
+- Participant, CU Hackathon 2026 (built the backend of a campus carpool prototype)
